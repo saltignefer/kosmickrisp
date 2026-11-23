@@ -57,7 +57,13 @@
 #define FLOAT_ROUND_TO_ZERO         1
 #define FLOAT_ROUND_DOWN            2
 #define FLOAT_ROUND_UP              3
+#ifndef FLOAT_ROUNDING_MODE
 #define FLOAT_ROUNDING_MODE         FLOAT_ROUND_NEAREST_EVEN
+#endif
+/* Conversions to fp32 round in the fp32 rounding mode */
+#ifndef FLOAT32_ROUNDING_MODE
+#define FLOAT32_ROUNDING_MODE       FLOAT_ROUND_NEAREST_EVEN
+#endif
 
 /* Relax propagation of NaN.  Binary operations with a NaN source will still
  * produce a NaN result, but it won't follow strict IEEE rules.
@@ -558,7 +564,7 @@ uint64_t
 __roundAndPackUInt64(uint zSign, uint zFrac0, uint zFrac1, uint zFrac2)
 {
    bool roundNearestEven;
-   bool increment;
+   bool increment = false;
    uint64_t default_nan = 0xFFFFFFFFFFFFFFFFUL;
 
    roundNearestEven = FLOAT_ROUNDING_MODE == FLOAT_ROUND_NEAREST_EVEN;
@@ -590,7 +596,7 @@ int64_t
 __roundAndPackInt64(uint zSign, uint zFrac0, uint zFrac1, uint zFrac2)
 {
    bool roundNearestEven;
-   bool increment;
+   bool increment = false;
    int64_t default_NegNaN = -0x7FFFFFFFFFFFFFFEL;
    int64_t default_PosNaN = 0xFFFFFFFFFFFFFFFFL;
 
@@ -1248,18 +1254,18 @@ __roundAndPackFloat32(uint zSign, int zExp, uint zFrac)
    int roundIncrement;
    int roundBits;
 
-   roundNearestEven = FLOAT_ROUNDING_MODE == FLOAT_ROUND_NEAREST_EVEN;
+   roundNearestEven = FLOAT32_ROUNDING_MODE == FLOAT_ROUND_NEAREST_EVEN;
    roundIncrement = 0x40;
    if (!roundNearestEven) {
-      if (FLOAT_ROUNDING_MODE == FLOAT_ROUND_TO_ZERO) {
+      if (FLOAT32_ROUNDING_MODE == FLOAT_ROUND_TO_ZERO) {
          roundIncrement = 0;
       } else {
          roundIncrement = 0x7F;
          if (zSign != 0u) {
-            if (FLOAT_ROUNDING_MODE == FLOAT_ROUND_UP)
+            if (FLOAT32_ROUNDING_MODE == FLOAT_ROUND_UP)
                roundIncrement = 0;
          } else {
-            if (FLOAT_ROUNDING_MODE == FLOAT_ROUND_DOWN)
+            if (FLOAT32_ROUNDING_MODE == FLOAT_ROUND_DOWN)
                roundIncrement = 0;
          }
       }
@@ -1267,7 +1273,8 @@ __roundAndPackFloat32(uint zSign, int zExp, uint zFrac)
    roundBits = int(zFrac & 0x7Fu);
    if (0xFDu <= uint(zExp)) {
       if ((0xFD < zExp) || ((zExp == 0xFD) && (int(zFrac) + roundIncrement) < 0))
-         return __packFloat32(zSign, 0xFF, 0u) - float(roundIncrement == 0);
+         return uintBitsToFloat(floatBitsToUint(__packFloat32(zSign, 0xFF, 0u)) -
+                                uint(roundIncrement == 0));
       int count = -zExp;
       bool zexp_lt0 = zExp < 0;
       uint zFrac_lt0 = mix(uint(zFrac != 0u), (zFrac>>count) | uint((zFrac<<((-count) & 31)) != 0u), (-zExp) < 32);
