@@ -2423,7 +2423,11 @@ alu_fp_math_mode_pragma(struct nir_to_msl_ctx *ctx, const nir_alu_instr *alu)
    if (!(ctx->disabled_workarounds & BITFIELD64_BIT(14))) {
       bool is_min_max_sz = (alu->op == nir_op_fmin || alu->op == nir_op_fmax) &&
                            (fp_math_ctrl & nir_fp_preserve_signed_zero);
-      if (is_min_max_sz || nir_alu_instr_is_comparison(alu))
+      bool is_float_cmp =
+         nir_alu_instr_is_comparison(alu) &&
+         nir_alu_type_get_base_type(nir_op_infos[alu->op].input_types[0]) ==
+            nir_type_float;
+      if (is_min_max_sz || is_float_cmp)
          return "safe";
    }
 
