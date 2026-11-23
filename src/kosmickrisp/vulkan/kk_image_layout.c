@@ -274,8 +274,11 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
    layout->linear = image->tiling != VK_IMAGE_TILING_OPTIMAL;
    layout->optimized_layout = kk_image_layout_can_optimize(
       pdev, usage, image->tiling, image->create_flags, format);
+   /* Atomics need storage usage. Shader write usage also makes Metal report
+    * wrong sparse residency for sampled images. */
    layout->usage = vk_image_usage_flags_to_mtl_texture_usage(
-      usage, image->create_flags, supported_format->atomic);
+      usage, image->create_flags,
+      supported_format->atomic && (usage & VK_IMAGE_USAGE_STORAGE_BIT));
    layout->create_flags = image->create_flags;
    layout->format.pipe = format;
    layout->format.mtl = supported_format->mtl_pixel_format;
