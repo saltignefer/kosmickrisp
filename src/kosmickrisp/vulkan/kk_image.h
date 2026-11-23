@@ -29,8 +29,23 @@ kk_get_image_format_features(struct kk_physical_device *pdevice,
 uint32_t kk_image_max_dimension(const struct kk_physical_device *pdev,
                                 VkImageType image_type);
 
+/* Opaque address space of a sparse image plane, in sparse pages. Each array
+ * layer holds its mip levels before the tail, tile by tile in X, Y, Z order,
+ * followed by its mip tail. */
+struct kk_sparse_image_layout {
+   struct mtl_size tile_px;
+   /* First mip level in the tail, the level count if there is no tail */
+   uint32_t tail_level;
+   uint32_t tail_pages;
+   uint64_t layer_pages;
+   /* First page of each level within a layer, up to tail_level included */
+   uint64_t level_page[KK_MAX_MIP_LEVELS + 1];
+   struct mtl_size level_tiles[KK_MAX_MIP_LEVELS];
+};
+
 struct kk_image_plane {
    struct kk_image_layout layout;
+   struct kk_sparse_image_layout sparse;
    struct kk_device_memory *mem;
    uint64_t mem_offset_B;
    // TODO_KOSMICKRISP Only have one handle since we will only create 2D arrays

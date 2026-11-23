@@ -257,6 +257,16 @@ kk_get_device_features(
       .shaderResourceMinLod = true,
       .sparseBinding = info->supports_sparse,
       .sparseResidencyBuffer = info->supports_sparse,
+      .sparseResidencyImage2D = info->supports_sparse,
+      .sparseResidency2Samples =
+         info->supports_sparse &&
+         (info->supported_sample_counts & VK_SAMPLE_COUNT_2_BIT),
+      .sparseResidency4Samples =
+         info->supports_sparse &&
+         (info->supported_sample_counts & VK_SAMPLE_COUNT_4_BIT),
+      .sparseResidency8Samples =
+         info->supports_sparse &&
+         (info->supported_sample_counts & VK_SAMPLE_COUNT_8_BIT),
       .sparseResidencyAliased = info->supports_sparse,
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
@@ -684,7 +694,9 @@ kk_get_device_properties(
        * back its own write to an unbound page sees the written value. */
       .sparseResidencyNonResidentStrict = false,
       .sparseResidencyAlignedMipSize = false,
-      .sparseResidencyStandard2DBlockShape = false,
+      /* 64 KiB Metal tiles match the standard 2D shapes, but not the 2x
+       * multisample ones */
+      .sparseResidencyStandard2DBlockShape = pdev->info.supports_sparse,
       .sparseResidencyStandard2DMultisampleBlockShape = false,
       .sparseResidencyStandard3DBlockShape = false,
 

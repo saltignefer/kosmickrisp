@@ -84,7 +84,7 @@ KosmicKrisp specific environment variables:
   - ``custom_border`` to advertise ``VK_EXT_custom_border_color`` and ``VK_EXT_border_color_swizzle``.
   - ``image_view_min_lod`` to advertise ``VK_EXT_image_view_min_lod`` for M1-M5 GPUs.
   - ``mesh_shader`` to advertise ``VK_EXT_mesh_shader`` on M3 and later GPUs. Work in progress.
-  - ``sparse`` to advertise sparse binding and sparse residency on M3 and later GPUs. Texel buffer views of sparse buffers are not supported.
+  - ``sparse`` to advertise sparse binding and sparse residency for buffers and 2D images on M3 and later GPUs. Texel buffer views of sparse buffers and sparse 3D images are not supported.
   - ``optimize_e5r9g9b9`` to use allowGPUOptimizedContents with this format, which causes some CTS tests for vkCmdCopyImage() to fail
 
 Contributions

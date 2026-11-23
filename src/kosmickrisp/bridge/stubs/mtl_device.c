@@ -189,7 +189,7 @@ mtl_device_supports_placement_sparse(mtl_device *dev)
 
 struct mtl_size
 mtl_placement_sparse_tile_size(mtl_device *device,
-                               struct kk_image_layout *layout)
+                               const struct kk_image_layout *layout)
 {
    return (struct mtl_size){1, 1, 1};
 }

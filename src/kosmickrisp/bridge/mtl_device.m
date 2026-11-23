@@ -361,7 +361,7 @@ mtl_device_supports_placement_sparse(mtl_device *device)
 
 struct mtl_size
 mtl_placement_sparse_tile_size(mtl_device *device,
-                               struct kk_image_layout *layout)
+                               const struct kk_image_layout *layout)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
