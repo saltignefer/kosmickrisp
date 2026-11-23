@@ -202,6 +202,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_robustness2 = true,
       .EXT_sample_locations = true,
       .EXT_shader_atomic_float = true,
+      .EXT_shader_image_atomic_int64 = pdev->info.supports_atomic_int64,
       .EXT_shader_replicated_composites = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
@@ -539,6 +540,9 @@ kk_get_device_features(
       .shaderSharedFloat32Atomics = true,
       .shaderSharedFloat32AtomicAdd =
          info->msl_version >= MTL_LANGUAGE_VERSION_4_1,
+
+      /* VK_EXT_shader_image_atomic_int64 */
+      .shaderImageInt64Atomics = info->supports_atomic_int64,
 
       /* VK_EXT_vertex_attribute_robustness */
       .vertexAttributeRobustness = true,

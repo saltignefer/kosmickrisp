@@ -386,12 +386,22 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
    }
 
    nir_variable *var = nir_deref_instr_get_variable(deref);
+   enum msl_tex_access_flag flags = msl_convert_access_flag(var->data.access);
+
+   /* 64-bit atomics read and write the texture under a lock, even atomic
+    * loads and stores of readonly and writeonly images */
+   bool atomic = nir_intrinsic_has_atomic_op(intr) ||
+                 (nir_intrinsic_has_access(intr) &&
+                  (nir_intrinsic_access(intr) & ACCESS_ATOMIC));
+   if (atomic && nir_alu_type_get_type_size(type) == 64)
+      flags = MSL_ACCESS_READ_WRITE;
+
    nir_def *handle = nir_load_texture_handle_kk(
       b, 1, 64, resource_addr, .dest_type = type,
       .image_dim = nir_intrinsic_image_dim(intr),
       .image_array = nir_intrinsic_image_array(intr),
       .access = nir_intrinsic_access(intr) | var->data.access,
-      .flags = msl_convert_access_flag(var->data.access));
+      .flags = flags);
 
    nir_rewrite_image_intrinsic(intr, handle, nir_image_intrinsic_type_bindless);
 

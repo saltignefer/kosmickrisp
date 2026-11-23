@@ -240,11 +240,18 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
             view_layout.view_type = original_type;
          }
 
-         /* Handle mutable formats */
+         /* Handle mutable formats. Render targets have no swizzle, so only a
+          * different Metal format needs a view. Clears of R64 images render
+          * to them as R32G32_UINT, both RG32Uint, and Metal can't make a
+          * view of more than one slice of a 3D texture. */
          if (view->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
-            view->planes[view_plane].render_is_view = requires_format_change;
-            if (requires_format_change) {
+            bool requires_mtl_format_change =
+               requires_format_change &&
+               view_layout.format.mtl != plane->layout.format.mtl;
+            view->planes[view_plane].render_is_view =
+               requires_mtl_format_change;
+            if (requires_mtl_format_change) {
                view->planes[view_plane].mtl_handle_render =
                   mtl_new_texture_view_with(mtl_handle, &view_layout, false);
             } else /* Subresource indices will be set in attachment descriptor */

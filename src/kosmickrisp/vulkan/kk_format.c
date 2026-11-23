@@ -51,6 +51,11 @@
    .bit_widths = width, .filter = 0u, .write = 1u, .color = 1u, .blend = 0u,   \
    .msaa = 0u, .resolve = 0u, .sparse = 1u, .atomic = 1u
 
+// Write, Sparse, Atomic
+#define MTL_FMT_WSA(width)                                                     \
+   .bit_widths = width, .filter = 0u, .write = 1u, .color = 0u, .blend = 0u,   \
+   .msaa = 0u, .resolve = 0u, .sparse = 1u, .atomic = 1u
+
 // Write, Color, Sparse
 #define MTL_FMT_WCS(width)                                                     \
    .bit_widths = width, .filter = 0u, .write = 1u, .color = 1u, .blend = 0u,   \
@@ -234,6 +239,12 @@ static const struct kk_va_format kk_vf_formats[] = {
 
    // 64-bit formats
    MTL_FMT_NATIVE(R32G32_UINT, MTL_FMT_WCMS(64), MTL_FMT_TB_WR),
+   /* Storage images of VK_EXT_shader_image_atomic_int64, read and written as
+    * ulong. Only exposed with kk_device_info::supports_atomic_int64. */
+   MTL_FMT(R64_UINT, R32G32_UINT, MTL_SWIZZLE_IDENTITY, MTL_FMT_WSA(64),
+           MTL_FMT_TB_NONE, 1, 9),
+   MTL_FMT(R64_SINT, R32G32_UINT, MTL_SWIZZLE_IDENTITY, MTL_FMT_WSA(64),
+           MTL_FMT_TB_NONE, 1, 9),
    MTL_FMT_NATIVE(R32G32_SINT, MTL_FMT_WCMS(64), MTL_FMT_TB_WR),
    MTL_FMT_NATIVE(R32G32_FLOAT, MTL_FMT_ALL_NO_ATOMIC(64), MTL_FMT_TB_WR),
    MTL_FMT_NATIVE(R16G16B16A16_UNORM, MTL_FMT_ALL_NO_ATOMIC(64), MTL_FMT_TB_WR),
@@ -386,6 +397,7 @@ static const struct kk_va_format kk_vf_formats[] = {
 #undef MTL_FMT_WCBMS
 #undef MTL_FMT_WCMS
 #undef MTL_FMT_WCSA
+#undef MTL_FMT_WSA
 #undef MTL_FMT_WCS
 #undef MTL_FMT_FMR
 #undef MTL_FMT_FS

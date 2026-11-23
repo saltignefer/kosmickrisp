@@ -340,7 +340,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       memset(dev->mesh_staging->cpu, 0, MSL_MESH_STAGING_LOCKS * 4u);
    }
 
-   if (dev->vk.enabled_features.shaderBufferInt64Atomics) {
+   if (dev->vk.enabled_features.shaderBufferInt64Atomics ||
+       dev->vk.enabled_features.shaderImageInt64Atomics) {
       result = kk_alloc_bo(dev, &dev->vk.base, MSL_ATOMIC64_LOCKS * 4u, 256u,
                            &dev->atomic64_locks);
       if (result != VK_SUCCESS)

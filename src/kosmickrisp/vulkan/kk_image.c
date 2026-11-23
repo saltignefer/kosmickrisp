@@ -78,6 +78,17 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
    if (p_format == PIPE_FORMAT_NONE)
       return 0;
 
+   /* 64-bit images only serve VK_EXT_shader_image_atomic_int64, and the
+    * shaders only access them as storage images */
+   if (p_format == PIPE_FORMAT_R64_UINT || p_format == PIPE_FORMAT_R64_SINT) {
+      if (!pdev->info.supports_atomic_int64)
+         return 0;
+      return VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+             VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
+             VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+             VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+   }
+
    /* You can't tile a non-power-of-two */
    if (!util_is_power_of_two_nonzero(util_format_get_blocksize(p_format)))
       return 0;
