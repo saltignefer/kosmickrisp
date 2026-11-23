@@ -521,8 +521,14 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          .layerCount = render->view_mask ? 1 : render->layer_count,
       };
 
+      /* Unlike vkCmdClearAttachments, load operations ignore conditional
+       * rendering */
+      struct kk_conditional_rendering_state cond_render =
+         cmd->state.cond_render;
+      cmd->state.cond_render.enabled = false;
       kk_CmdClearAttachments(kk_cmd_buffer_to_handle(cmd), clear_count,
                              clear_att, 1, &clear_rect);
+      cmd->state.cond_render = cond_render;
    }
 }
 
