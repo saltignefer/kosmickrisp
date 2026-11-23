@@ -331,6 +331,15 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_sampler_heap;
 
+   if (dev->vk.enabled_features.meshShader) {
+      result = kk_alloc_bo(dev, &dev->vk.base, MSL_MESH_STAGING_BO_SIZE, 256u,
+                           &dev->mesh_staging);
+      if (result != VK_SUCCESS)
+         goto fail_lib;
+      /* Free slot locks */
+      memset(dev->mesh_staging->cpu, 0, MSL_MESH_STAGING_LOCKS * 4u);
+   }
+
    if (pdev->settings.gpu_capture_immediately) {
       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
       dev->gpu_capture_active = true;
@@ -340,6 +349,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    return VK_SUCCESS;
 
+fail_lib:
+   kk_device_finish_lib(dev);
 fail_sampler_heap:
    kk_destroy_sampler_heap(dev, &dev->samplers);
 fail_query_table:
@@ -386,6 +397,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* Geometry heap */
    if (dev->heap)
       kk_destroy_bo(dev, dev->heap);
+
+   if (dev->mesh_staging)
+      kk_destroy_bo(dev, dev->mesh_staging);
 
    if (dev->has_queue) {
       kk_queue_finish(dev, &dev->queue);

@@ -111,10 +111,14 @@ emit_inputs(struct nir_to_msl_ctx *ctx, nir_shader *shader)
    P_IND(ctx, "constant SamplerTable &sampler_table [[buffer(1)]]");
    if (ctx->uses_per_draw_data) {
       P(ctx, ",\n");
-      P_IND(ctx, "constant Buffer &per_draw [[buffer(2)]]\n");
-   } else {
-      P(ctx, "\n");
+      P_IND(ctx, "constant Buffer &per_draw [[buffer(2)]]");
    }
+   if (ctx->mesh_device_staging) {
+      P(ctx, ",\n");
+      P_IND(ctx, "device uchar *kk_mesh_staging [[buffer(%u)]]",
+            MSL_MESH_STAGING_BUFFER);
+   }
+   P(ctx, "\n");
 }
 
 static const char *
@@ -1001,9 +1005,12 @@ memory_modes_to_msl(struct nir_to_msl_ctx *ctx, nir_variable_mode modes)
          P(ctx, "mem_flags::mem_none");
          break;
       case nir_var_mem_shared:
-      /* Mesh outputs are staged in threadgroup memory */
-      case nir_var_shader_out:
          P(ctx, "mem_flags::mem_threadgroup");
+         break;
+      /* Mesh outputs are staged in threadgroup or device memory */
+      case nir_var_shader_out:
+         P(ctx, ctx->mesh_device_staging ? "mem_flags::mem_device"
+                                         : "mem_flags::mem_threadgroup");
          break;
       case nir_var_mem_task_payload:
          P(ctx, "mem_flags::mem_object_data");
@@ -2473,7 +2480,9 @@ emit_mesh_epilogue(struct nir_to_msl_ctx *ctx, nir_shader *shader)
                       shader->info.workgroup_size[2];
    unsigned indices = msl_mesh_indices_per_primitive(shader);
 
-   P_IND(ctx, "threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+   P_IND(ctx, "threadgroup_barrier(%s);\n",
+         ctx->mesh_device_staging ? "mem_flags::mem_device"
+                                  : "mem_flags::mem_threadgroup");
    P_IND(ctx,
          "for (uint i = gl_LocalInvocationIndex; i < kk_mesh_vertex_count; "
          "i += %u)\n",
@@ -2523,6 +2532,17 @@ emit_mesh_epilogue(struct nir_to_msl_ctx *ctx, nir_shader *shader)
    P_IND(ctx, "}\n");
    P_IND(ctx, "if (gl_LocalInvocationIndex == 0u)\n");
    P_IND(ctx, "    kk_mesh.set_primitive_count(kk_mesh_primitive_count);\n");
+
+   /* Release the staging slot once every invocation is done with it */
+   if (ctx->mesh_device_staging) {
+      P_IND(ctx, "threadgroup_barrier(mem_flags::mem_device);\n");
+      P_IND(ctx, "if (gl_LocalInvocationIndex == 0u) {\n");
+      P_IND(ctx, "    atomic_thread_fence(mem_flags::mem_device, "
+                 "memory_order_seq_cst, thread_scope_device);\n");
+      P_IND(ctx, "    atomic_store_explicit(kk_slot_lock, 0u, "
+                 "memory_order_relaxed);\n");
+      P_IND(ctx, "}\n");
+   }
 }
 
 static void
@@ -2750,6 +2770,15 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
       /* The epilogue splits the output work among the threads */
       BITSET_SET(ctx->shader->info.system_values_read,
                  SYSTEM_VALUE_LOCAL_INVOCATION_INDEX);
+
+      /* Workgroups pick their staging slot by index */
+      ctx->mesh_device_staging = msl_mesh_device_staging(ctx, ctx->shader);
+      if (ctx->mesh_device_staging) {
+         BITSET_SET(ctx->shader->info.system_values_read,
+                    SYSTEM_VALUE_WORKGROUP_ID);
+         BITSET_SET(ctx->shader->info.system_values_read,
+                    SYSTEM_VALUE_NUM_WORKGROUPS);
+      }
    }
 
    if (ctx->shader->info.stage == MESA_SHADER_VERTEX ||

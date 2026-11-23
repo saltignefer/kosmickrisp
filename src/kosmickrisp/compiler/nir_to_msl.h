@@ -25,6 +25,15 @@ struct nir_to_msl_options {
    uint8_t rts_component_count[MAX_DRAW_BUFFERS];
 };
 
+/* Mesh shaders whose outputs do not fit twice in threadgroup memory stage
+ * them in a device buffer bound at index 3: MSL_MESH_STAGING_LOCKS locks, then
+ * MSL_MESH_STAGING_SIZE bytes of staging slots. */
+#define MSL_MESH_STAGING_BUFFER 3u
+#define MSL_MESH_STAGING_LOCKS  4096u
+#define MSL_MESH_STAGING_SIZE   (32u << 20)
+#define MSL_MESH_STAGING_BO_SIZE                                               \
+   (MSL_MESH_STAGING_LOCKS * 4u + MSL_MESH_STAGING_SIZE)
+
 /* Assumes nir_shader_gather_info has been called beforehand. */
 char *nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options);
 

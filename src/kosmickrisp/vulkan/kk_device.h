@@ -103,6 +103,10 @@ struct kk_device {
 
    /* Geomtry heap */
    struct kk_bo *heap;
+
+   /* Mesh outputs that do not fit in threadgroup memory, see
+    * MSL_MESH_STAGING_SIZE */
+   struct kk_bo *mesh_staging;
    util_once_flag heap_init_once;
 
    bool gpu_capture_active;

@@ -25,6 +25,8 @@ struct nir_to_msl_ctx {
    struct _mesa_string_buffer *text;
    uint64_t disabled_workarounds;
    bool uses_per_draw_data;
+   /* Mesh outputs are staged in device memory, see msl_mesh_device_staging */
+   bool mesh_device_staging;
    unsigned short indentlevel;
    struct io_slot_info inputs_info[NUM_TOTAL_VARYING_SLOTS];
    struct io_slot_info outputs_info[NUM_TOTAL_VARYING_SLOTS];
@@ -86,6 +88,8 @@ uint64_t msl_mesh_primitive_outputs(const nir_shader *shader);
 unsigned msl_mesh_indices_per_primitive(const nir_shader *shader);
 
 bool msl_mesh_needs_default_point_size(const nir_shader *shader);
+
+bool msl_mesh_device_staging(struct nir_to_msl_ctx *ctx, nir_shader *shader);
 
 void msl_mesh_output_name(struct nir_to_msl_ctx *ctx, unsigned location,
                           unsigned component);

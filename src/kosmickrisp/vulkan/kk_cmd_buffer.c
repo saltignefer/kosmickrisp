@@ -20,6 +20,7 @@
 #include "kosmickrisp/bridge/mtl_device.h"
 #include "kosmickrisp/bridge/mtl_encoder.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
+#include "kosmickrisp/compiler/nir_to_msl.h"
 
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
@@ -134,10 +135,14 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
 
    {
       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
-      /* Root at 0, samplers at 1 and per draw data at 2 */
-      mtl_set_max_buffer_binding_count(desc, 3u);
+      /* Root at 0, samplers at 1, per draw data at 2 and mesh output staging
+       * at 3 */
+      mtl_set_max_buffer_binding_count(desc, 4u);
       cmd->argument_table = mtl_new_argument_table(dev->mtl_handle, desc);
       mtl_set_address(cmd->argument_table, dev->samplers.table.bo->gpu, 1u);
+      if (dev->mesh_staging)
+         mtl_set_address(cmd->argument_table, dev->mesh_staging->gpu,
+                         MSL_MESH_STAGING_BUFFER);
       mtl_release(desc);
    }
 

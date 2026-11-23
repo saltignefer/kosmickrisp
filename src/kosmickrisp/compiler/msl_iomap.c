@@ -282,11 +282,107 @@ mesh_output_blocks(nir_shader *shader, struct nir_to_msl_ctx *ctx)
    };
    assert(shader->info.mesh.primitive_type < ARRAY_SIZE(topology) &&
           topology[shader->info.mesh.primitive_type]);
+   unsigned max_vertices = MAX2(shader->info.mesh.max_vertices_out, 1u);
+   unsigned max_primitives = MAX2(shader->info.mesh.max_primitives_out, 1u);
    P(ctx, "using kk_mesh_t = metal::mesh<%s, %s, %u, %u, topology::%s>;\n",
      VERTEX_OUTPUT_TYPE, prim_outputs ? MESH_PRIMITIVE_OUTPUT_TYPE : "void",
-     MAX2(shader->info.mesh.max_vertices_out, 1u),
-     MAX2(shader->info.mesh.max_primitives_out, 1u),
-     topology[shader->info.mesh.primitive_type]);
+     max_vertices, max_primitives, topology[shader->info.mesh.primitive_type]);
+
+   if (!ctx->mesh_device_staging)
+      return;
+
+   /* One slot of the device staging buffer */
+   P(ctx, "struct KKMeshStaging {\n");
+   P(ctx, "    %s kk_mesh_verts[%u];\n", VERTEX_OUTPUT_TYPE, max_vertices);
+   if (prim_outputs)
+      P(ctx, "    %s kk_mesh_prims[%u];\n", MESH_PRIMITIVE_OUTPUT_TYPE,
+        max_primitives);
+   P(ctx, "    uchar kk_mesh_indices[%u];\n",
+     max_primitives * msl_mesh_indices_per_primitive(shader));
+   if (shader->info.cull_distance_array_size)
+      P(ctx, "    float kk_mesh_cull_distances[%u][%u];\n", max_vertices,
+        shader->info.cull_distance_array_size);
+   P(ctx, "    uint kk_mesh_vertex_count;\n");
+   P(ctx, "    uint kk_mesh_primitive_count;\n");
+   P(ctx, "};\n");
+}
+
+/* Adds a member to a C struct layout */
+static void
+layout_member(unsigned *offset, unsigned *align, unsigned size,
+              unsigned member_align)
+{
+   *offset = ALIGN_POT(*offset, member_align) + size;
+   *align = MAX2(*align, member_align);
+}
+
+/* Adds the members mesh_output_member emits for a slot */
+static void
+layout_mesh_output(struct nir_to_msl_ctx *ctx, unsigned location,
+                   unsigned *offset, unsigned *align)
+{
+   if (location == VARYING_SLOT_CULL_PRIMITIVE) {
+      layout_member(offset, align, 1u, 1u);
+      return;
+   }
+
+   struct io_slot_info info = ctx->outputs_info[location];
+   nir_alu_type type = msl_varying_member_type(location, info.type);
+   unsigned component_size = MAX2(nir_alu_type_get_type_size(type), 8u) / 8u;
+   if (VARYING_SLOT_INFO[location].scalarized) {
+      for (unsigned c = 0; c < info.num_components; c++)
+         layout_member(offset, align, component_size, component_size);
+   } else {
+      /* 3-component vectors take the space of 4 */
+      unsigned size =
+         component_size * util_next_power_of_two(MAX2(info.num_components, 1u));
+      layout_member(offset, align, size, size);
+   }
+}
+
+/* Sizes of the vertex and primitive structs mesh_output_blocks declares */
+static void
+mesh_struct_sizes(struct nir_to_msl_ctx *ctx, nir_shader *shader,
+                  unsigned *vertex_size, unsigned *primitive_size)
+{
+   unsigned offset = 0u, align = 1u;
+   if (!(msl_mesh_vertex_outputs(shader) & VARYING_BIT_POS))
+      layout_member(&offset, &align, 16u, 16u);
+   if (msl_mesh_needs_default_point_size(shader))
+      layout_member(&offset, &align, 4u, 4u);
+   u_foreach_bit64(location, msl_mesh_vertex_outputs(shader))
+      layout_mesh_output(ctx, location, &offset, &align);
+   if (shader->info.clip_distance_array_size)
+      layout_member(&offset, &align, shader->info.clip_distance_array_size * 4u,
+                    4u);
+   *vertex_size = ALIGN_POT(offset, align);
+
+   offset = 0u, align = 1u;
+   u_foreach_bit64(location, msl_mesh_primitive_outputs(shader))
+      layout_mesh_output(ctx, location, &offset, &align);
+   *primitive_size = ALIGN_POT(offset, align);
+}
+
+/* Metal allows 61440 bytes of threadgroup memory plus mesh output, which the
+ * staging copy of the outputs would exceed. Indices are not part of the mesh
+ * output in Metal. */
+bool
+msl_mesh_device_staging(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+{
+   unsigned max_vertices = MAX2(shader->info.mesh.max_vertices_out, 1u);
+   unsigned max_primitives = MAX2(shader->info.mesh.max_primitives_out, 1u);
+   unsigned vertex_size, primitive_size;
+   mesh_struct_sizes(ctx, shader, &vertex_size, &primitive_size);
+
+   unsigned mesh_output =
+      max_vertices * vertex_size + max_primitives * primitive_size;
+   unsigned staging =
+      mesh_output + max_primitives * msl_mesh_indices_per_primitive(shader) +
+      max_vertices * shader->info.cull_distance_array_size * 4u +
+      2u * sizeof(uint32_t);
+   /* Room for the alignment of each threadgroup variable */
+   unsigned padding = 6u * 16u;
+   return shader->info.shared_size + staging + padding + mesh_output > 61440u;
 }
 
 /* Per-vertex outputs in the vertex struct as members of their own. Clip
@@ -633,6 +729,53 @@ msl_emit_io_blocks(struct nir_to_msl_ctx *ctx, nir_shader *shader)
    P(ctx, "};\n")
 }
 
+/* Takes the device staging slot of the workgroup. Workgroups map to slots by
+ * their index, and a workgroup waits for one that runs on the same slot. That
+ * one holds the slot only while it runs, so it releases it. */
+static void
+mesh_device_staging_var(struct nir_to_msl_ctx *ctx)
+{
+   P_IND(ctx,
+         "constexpr uint kk_fitting_slots = %uu / sizeof(KKMeshStaging);\n",
+         MSL_MESH_STAGING_SIZE);
+   P_IND(ctx,
+         "constexpr uint kk_slots = kk_fitting_slots < %uu ? kk_fitting_slots "
+         ": %uu;\n",
+         MSL_MESH_STAGING_LOCKS, MSL_MESH_STAGING_LOCKS);
+   P_IND(ctx, "uint kk_slot = (gl_WorkGroupID.x + gl_NumWorkGroups.x * "
+              "(gl_WorkGroupID.y + gl_NumWorkGroups.y * gl_WorkGroupID.z)) "
+              "%% kk_slots;\n");
+   P_IND(ctx, "device atomic_uint *kk_slot_lock = (device atomic_uint "
+              "*)kk_mesh_staging + kk_slot;\n");
+   P_IND(ctx, "if (gl_LocalInvocationIndex == 0u) {\n");
+   P_IND(ctx, "    while (atomic_exchange_explicit(kk_slot_lock, 1u, "
+              "memory_order_relaxed) != 0u) {}\n");
+   P_IND(ctx, "    atomic_thread_fence(mem_flags::mem_device, "
+              "memory_order_seq_cst, thread_scope_device);\n");
+   P_IND(ctx, "}\n");
+   P_IND(ctx, "threadgroup_barrier(mem_flags::mem_device);\n");
+   P_IND(ctx,
+         "device KKMeshStaging &kk_staging = ((device KKMeshStaging *)"
+         "(kk_mesh_staging + %uu))[kk_slot];\n",
+         MSL_MESH_STAGING_LOCKS * 4u);
+   P_IND(ctx, "device auto &kk_mesh_verts = kk_staging.kk_mesh_verts;\n");
+   if (msl_mesh_primitive_outputs(ctx->shader))
+      P_IND(ctx, "device auto &kk_mesh_prims = kk_staging.kk_mesh_prims;\n");
+   P_IND(ctx, "device auto &kk_mesh_indices = kk_staging.kk_mesh_indices;\n");
+   if (ctx->shader->info.cull_distance_array_size)
+      P_IND(ctx, "device auto &kk_mesh_cull_distances = "
+                 "kk_staging.kk_mesh_cull_distances;\n");
+   P_IND(
+      ctx,
+      "device auto &kk_mesh_vertex_count = kk_staging.kk_mesh_vertex_count;\n");
+   P_IND(ctx, "device auto &kk_mesh_primitive_count = "
+              "kk_staging.kk_mesh_primitive_count;\n");
+   P_IND(ctx, "if (gl_LocalInvocationIndex == 0u) {\n");
+   P_IND(ctx, "    kk_mesh_vertex_count = 0u;\n");
+   P_IND(ctx, "    kk_mesh_primitive_count = 0u;\n");
+   P_IND(ctx, "}\n");
+}
+
 void
 msl_emit_output_var(struct nir_to_msl_ctx *ctx, nir_shader *shader)
 {
@@ -652,6 +795,11 @@ msl_emit_output_var(struct nir_to_msl_ctx *ctx, nir_shader *shader)
       }
       break;
    case MESA_SHADER_MESH: {
+      if (ctx->mesh_device_staging) {
+         mesh_device_staging_var(ctx);
+         break;
+      }
+
       /* Vulkan mesh outputs are written per field and may be read back, Metal
        * only takes whole vertices and primitives. Stage them in threadgroup
        * memory. The counts of the first invocation apply. */
