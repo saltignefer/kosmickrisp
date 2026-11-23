@@ -532,7 +532,7 @@ __roundAndPackFloat64(uint zSign,
          zFrac0, zFrac1, zFrac2, -zExp, zFrac0, zFrac1, zFrac2);
       zExp = 0;
       if (roundNearestEven) {
-         increment = zFrac2 < 0u;
+         increment = int(zFrac2) < 0;
       } else {
          if (zSign != 0u) {
             increment = (FLOAT_ROUNDING_MODE == FLOAT_ROUND_DOWN) &&
@@ -546,7 +546,8 @@ __roundAndPackFloat64(uint zSign,
 
    if (increment) {
       __add64(zFrac0, zFrac1, 0u, 1u, zFrac0, zFrac1);
-      zFrac1 &= ~((zFrac2 + uint(zFrac2 == 0u)) & uint(roundNearestEven));
+      /* Ties round to even */
+      zFrac1 &= ~(uint((zFrac2 << 1) == 0u) & uint(roundNearestEven));
    } else {
       zExp = mix(zExp, 0, (zFrac0 | zFrac1) == 0u);
    }
@@ -1632,7 +1633,7 @@ __ftrunc64(uint64_t __a)
    zHi = maskHi & a.y;
 
    zLo = mix(zLo, 0u, unbiasedExp < 0);
-   zHi = mix(zHi, 0u, unbiasedExp < 0);
+   zHi = mix(zHi, a.y & 0x80000000u, unbiasedExp < 0);
    zLo = mix(zLo, a.x, unbiasedExp > 52);
    zHi = mix(zHi, a.y, unbiasedExp > 52);
    return packUint2x32(uvec2(zLo, zHi));
@@ -1673,9 +1674,6 @@ __fround64(uint64_t __a)
 
    if (unbiasedExp < 20) {
       if (unbiasedExp < 0) {
-         if ((aHi & 0x80000000u) != 0u && aLo == 0u) {
-            return 0ul;
-         }
          aHi &= 0x80000000u;
          if ((a.y & 0x000FFFFFu) == 0u && a.x == 0u) {
             aLo = 0u;
@@ -1687,7 +1685,7 @@ __fround64(uint64_t __a)
          uint maskExp = 0x000FFFFFu >> unbiasedExp;
          uint lastBit = maskExp + 1;
          aHi += 0x00080000u >> unbiasedExp;
-         if ((aHi & maskExp) == 0u)
+         if ((aHi & maskExp) == 0u && aLo == 0u)
             aHi &= ~lastBit;
          aHi &= ~maskExp;
          aLo = 0u;
@@ -1702,6 +1700,13 @@ __fround64(uint64_t __a)
       if(tmp < aLo)
          aHi += 1u;
       aLo = tmp;
+      /* Ties round to even */
+      if ((aLo & maskExp) == 0u) {
+         if (unbiasedExp == 20)
+            aHi &= ~1u;
+         else
+            aLo &= ~(maskExp + 1u);
+      }
       aLo &= ~maskExp;
    }
 
