@@ -271,6 +271,7 @@ kk_get_device_features(
          info->supports_sparse &&
          (info->supported_sample_counts & VK_SAMPLE_COUNT_8_BIT),
       .sparseResidencyAliased = info->supports_sparse,
+      .shaderResourceResidency = info->supports_sparse,
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
