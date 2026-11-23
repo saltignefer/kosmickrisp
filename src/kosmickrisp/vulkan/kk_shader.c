@@ -2161,6 +2161,97 @@ kk_forward_gs_primitive_id(nir_shader *gs, nir_shader *fs)
    }
 }
 
+struct forward_distances {
+   /* Slots replacing VARYING_SLOT_CLIP_DIST0 and 1, zero if not forwarded */
+   unsigned slots[2];
+};
+
+static bool
+forward_distance(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct forward_distances *fwd = data;
+   bool fs = b->shader->info.stage == MESA_SHADER_FRAGMENT;
+
+   if (fs ? !nir_is_input_load(intr)
+          : intr->intrinsic != nir_intrinsic_store_per_vertex_output)
+      return false;
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location != VARYING_SLOT_CLIP_DIST0 &&
+       sem.location != VARYING_SLOT_CLIP_DIST1)
+      return false;
+
+   nir_src *offset = nir_get_io_offset_src(intr);
+   unsigned index =
+      sem.location - VARYING_SLOT_CLIP_DIST0 + nir_src_as_uint(*offset);
+   assert(index < ARRAY_SIZE(fwd->slots));
+   if (!fwd->slots[index])
+      return false;
+
+   sem.location = fwd->slots[index];
+   sem.num_slots = 1;
+
+   if (fs) {
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_intrinsic_set_io_semantics(intr, sem);
+      nir_src_rewrite(offset, nir_imm_int(b, 0));
+      return true;
+   }
+
+   /* The mesh shader keeps writing the distances Metal clips and culls with */
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_store_per_vertex_output(
+      b, intr->src[0].ssa, nir_get_io_arrayed_index_src(intr)->ssa,
+      nir_imm_int(b, 0), .component = nir_intrinsic_component(intr),
+      .write_mask = nir_intrinsic_write_mask(intr),
+      .src_type = nir_intrinsic_src_type(intr), .io_semantics = sem);
+   return true;
+}
+
+/* Metal has no fragment input for clip and cull distances, and a mesh shader
+ * writes them to the clip_distance array and to the staging array its
+ * primitives are culled with. Pass the ones the fragment shader reads as
+ * varyings in slots neither shader uses instead. Runs before the distances are
+ * split, so the cull distances are still merged into the clip distance slots
+ * of both shaders. */
+static void
+kk_forward_mesh_distances(nir_shader *mesh, nir_shader *fs)
+{
+   assert(mesh->info.io_lowered && fs->info.io_lowered);
+
+   uint64_t used = mesh->info.outputs_written | fs->info.inputs_read;
+   unsigned slot = VARYING_SLOT_VAR31;
+   struct forward_distances fwd = {0};
+   uint64_t forwarded = 0, slots = 0;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(fwd.slots); i++) {
+      if (!(fs->info.inputs_read & BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST0 + i)))
+         continue;
+
+      while (slot >= VARYING_SLOT_VAR0 && (used & BITFIELD64_BIT(slot)))
+         --slot;
+      if (slot < VARYING_SLOT_VAR0)
+         return;
+
+      fwd.slots[i] = slot;
+      used |= BITFIELD64_BIT(slot);
+      slots |= BITFIELD64_BIT(slot);
+      forwarded |= BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST0 + i);
+   }
+
+   if (!forwarded)
+      return;
+
+   nir_shader_intrinsics_pass(fs, forward_distance, nir_metadata_control_flow,
+                              &fwd);
+   nir_shader_intrinsics_pass(mesh, forward_distance,
+                              nir_metadata_control_flow, &fwd);
+
+   fs->info.inputs_read &= ~forwarded;
+   fs->info.inputs_read |= slots;
+   mesh->info.outputs_written |= slots;
+}
+
 static VkResult
 kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
                    struct vk_shader_compile_info *infos,
@@ -2237,6 +2328,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
               nir_shaders[total_shaders - 2u]->info.stage == MESA_SHADER_MESH) {
       kk_forward_gs_primitive_id(nir_shaders[total_shaders - 2u],
                                  nir_shaders[total_shaders - 1u]);
+      kk_forward_mesh_distances(nir_shaders[total_shaders - 2u],
+                                nir_shaders[total_shaders - 1u]);
    }
 
    nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,

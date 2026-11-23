@@ -707,7 +707,7 @@ msl_nir_lower_cull_distance_fs(nir_shader *s, unsigned nr_distances)
       nir_def *cull = nir_load_interpolated_input(
          b, 1, 32, baryc, nir_imm_int(b, 0), .component = i & 3,
          .io_semantics.location = VARYING_SLOT_CULL_PRIMITIVE + (i / 4),
-         .io_semantics.num_slots = nr_distances / 4);
+         .io_semantics.num_slots = 1);
 
       /* When the cull distance is negative in the vertex shader, the resulting
        * cull primitive output is zero, otherwise it is one. Thus, the
@@ -735,7 +735,9 @@ scalarize_clip_cull_distance_filter(const nir_intrinsic_instr *intrin,
 {
    if (intrin->intrinsic != nir_intrinsic_store_output &&
        intrin->intrinsic != nir_intrinsic_store_per_vertex_output &&
-       intrin->intrinsic != nir_intrinsic_load_per_vertex_output)
+       intrin->intrinsic != nir_intrinsic_load_per_vertex_output &&
+       intrin->intrinsic != nir_intrinsic_load_input &&
+       intrin->intrinsic != nir_intrinsic_load_interpolated_input)
       return false;
    nir_io_semantics semantics = nir_intrinsic_io_semantics(intrin);
    return semantics.location == VARYING_SLOT_CLIP_DIST0 ||
@@ -747,7 +749,12 @@ scalarize_clip_cull_distance_filter(const nir_intrinsic_instr *intrin,
 void
 msl_nir_lower_clip_cull_distance(nir_shader *nir, unsigned num_cull_distances)
 {
-   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out,
+   /* nir_opt_varyings leaves the fragment input loads vectorized. Vertex
+    * inputs are attributes, their locations mean something else. */
+   nir_variable_mode modes = nir->info.stage == MESA_SHADER_FRAGMENT
+                                ? nir_var_shader_in
+                                : nir_var_shader_out;
+   NIR_PASS(_, nir, nir_lower_io_to_scalar, modes,
             scalarize_clip_cull_distance_filter, NULL);
    NIR_PASS(_, nir, nir_separate_merged_clip_cull_io);
    /* The MSL backend handles mesh clip and cull distances */
