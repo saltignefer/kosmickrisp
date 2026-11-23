@@ -788,7 +788,8 @@ kk_get_device_properties(
       .minSubgroupSize = 32,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = pdev->info.max_workgroup_invocations / 32,
-      .requiredSubgroupSizeStages = 0,
+      .requiredSubgroupSizeStages =
+         VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
       .maxInlineUniformBlockSize = KK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
@@ -875,16 +876,17 @@ kk_get_device_properties(
 
       /* VK_EXT_mesh_shader. Metal allows 256 vertices, 512 primitives and
        * 32 KiB of output per mesh threadgroup, and no more than 124 varying
-       * components. Threadgroup memory plus mesh output may not exceed
+       * components, the position included. Threadgroup memory plus mesh output may not exceed
        * 60 KiB, so mesh outputs are staged in device memory when a threadgroup
        * copy does not fit, see msl_mesh_device_staging. Object functions
-       * reserve 16 bytes of threadgroup memory. Metal drops draws, and mesh
-       * grids launched by object functions, of 2^20 threadgroups or more.
+       * reserve 16 bytes of threadgroup memory. Metal silently drops mesh
+       * grids, from draws and from object functions alike, of 2^20
+       * threadgroups or more. The object grid of a draw has no such limit.
        * Some of these values are below the Vulkan minimums, which is why mesh
        * shaders are experimental. Multiview draws once per view, see
        * kk_draw_mesh, but render pass clears go through vertex amplification,
        * which bounds the view count. */
-      .maxTaskWorkGroupTotalCount = (1u << 20) - 1u,
+      .maxTaskWorkGroupTotalCount = 1u << 22,
       .maxTaskWorkGroupCount = {65535, 65535, 65535},
       .maxTaskWorkGroupInvocations = 128,
       .maxTaskWorkGroupSize = {128, 128, 128},
@@ -899,7 +901,7 @@ kk_get_device_properties(
       .maxMeshPayloadAndSharedMemorySize = 28672,
       .maxMeshOutputMemorySize = 32768,
       .maxMeshPayloadAndOutputMemorySize = 49152,
-      .maxMeshOutputComponents = 124,
+      .maxMeshOutputComponents = 120,
       .maxMeshOutputVertices = 256,
       .maxMeshOutputPrimitives = 256,
       .maxMeshOutputLayers = 8,
