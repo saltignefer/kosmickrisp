@@ -254,6 +254,8 @@ kk_get_device_features(
       .shaderImageGatherExtended = true,
       .shaderInt16 = true,
       .shaderInt64 = true,
+      /* Emulated in software with 64-bit integer math */
+      .shaderFloat64 = info->gpu_apple_family >= 9,
       .shaderResourceMinLod = true,
       .sparseBinding = info->supports_sparse,
       .sparseResidencyBuffer = info->supports_sparse,
@@ -735,7 +737,8 @@ kk_get_device_properties(
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
       .shaderSignedZeroInfNanPreserveFloat16 = true,
       .shaderSignedZeroInfNanPreserveFloat32 = true,
-      .shaderSignedZeroInfNanPreserveFloat64 = false,
+      /* The software fp64 library is IEEE 754 with round to nearest even */
+      .shaderSignedZeroInfNanPreserveFloat64 = pdev->info.gpu_apple_family >= 9,
       .shaderDenormPreserveFloat16 = false,
       .shaderDenormPreserveFloat32 = false,
       .shaderDenormPreserveFloat64 = false,
@@ -744,7 +747,7 @@ kk_get_device_properties(
       .shaderDenormFlushToZeroFloat64 = false,
       .shaderRoundingModeRTEFloat16 = true,
       .shaderRoundingModeRTEFloat32 = true,
-      .shaderRoundingModeRTEFloat64 = false,
+      .shaderRoundingModeRTEFloat64 = pdev->info.gpu_apple_family >= 9,
       .shaderRoundingModeRTZFloat16 = false,
       .shaderRoundingModeRTZFloat32 = false,
       .shaderRoundingModeRTZFloat64 = false,
@@ -1314,6 +1317,8 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    if (result != VK_SUCCESS)
       goto fail_disk_cache;
 
+   simple_mtx_init(&pdev->softfp64_lock, mtx_plain);
+
    list_add(&pdev->vk.link, &instance->vk.physical_devices.list);
 
    return VK_SUCCESS;
@@ -1334,6 +1339,8 @@ kk_physical_device_destroy(struct vk_physical_device *vk_pdev)
       container_of(vk_pdev, struct kk_physical_device, vk);
 
    kk_finish_wsi(pdev);
+   ralloc_free(pdev->softfp64);
+   simple_mtx_destroy(&pdev->softfp64_lock);
    kk_physical_device_free_disk_cache(pdev);
    vk_physical_device_finish(&pdev->vk);
    mtl_release(pdev->mtl_dev_handle);

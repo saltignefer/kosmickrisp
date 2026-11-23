@@ -12,6 +12,8 @@
 
 #include "kosmickrisp/bridge/mtl_types.h"
 
+#include "util/simple_mtx.h"
+
 #include "vk_physical_device.h"
 #include "vk_sync.h"
 #include "vk_sync_binary.h"
@@ -82,6 +84,10 @@ struct kk_physical_device {
 
    struct kk_queue_family queue_families[3];
    uint8_t queue_family_count;
+
+   /* Software fp64 library, built on first use */
+   simple_mtx_t softfp64_lock;
+   struct nir_shader *softfp64;
 };
 
 static inline uint32_t
