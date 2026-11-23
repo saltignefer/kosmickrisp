@@ -24,6 +24,13 @@ lower = [
     ('irem', a, b), ('iadd', ('irem', a, b), b))),
 ]
 
+# msl_nir_lower_fp64 runs after the optimization loop that lowers these
+lower += [
+  (('unpack_64_2x32_split_x', a), ('u2u32', a)),
+  (('unpack_64_2x32_split_y', a), ('u2u32', ('ushr', a, 32))),
+  (('pack_64_2x32_split', a, b),
+   ('ior', ('u2u64', a), ('ishl', ('u2u64', b), 32))),
+]
 
 
 def main():

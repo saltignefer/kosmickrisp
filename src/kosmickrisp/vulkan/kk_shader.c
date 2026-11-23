@@ -67,124 +67,6 @@ kk_get_spirv_options(struct vk_physical_device *vk_pdev,
    };
 }
 
-#include "float64_spv.h"
-
-static const nir_shader *
-kk_get_softfp64(struct kk_physical_device *pdev)
-{
-   simple_mtx_lock(&pdev->softfp64_lock);
-   if (!pdev->softfp64) {
-      const struct spirv_capabilities caps = {
-         .Float64 = true,
-         .Int64 = true,
-         .Shader = true,
-      };
-      const struct spirv_to_nir_options options = {
-         .capabilities = &caps,
-         .environment = NIR_SPIRV_VULKAN,
-         .create_library = true,
-      };
-      nir_shader *lib = spirv_to_nir(
-         float64_spv_source, ARRAY_SIZE(float64_spv_source), NULL,
-         MESA_SHADER_COMPUTE, "main", &options, &kk_nir_options);
-      NIR_PASS(_, lib, nir_lower_variable_initializers, nir_var_function_temp);
-      NIR_PASS(_, lib, nir_lower_returns);
-      NIR_PASS(_, lib, nir_inline_functions);
-      nir_remove_non_exported(lib);
-      NIR_PASS(_, lib, nir_lower_vars_to_ssa);
-      NIR_PASS(_, lib, nir_opt_copy_prop);
-      NIR_PASS(_, lib, nir_opt_dce);
-      nir_sweep(lib);
-      pdev->softfp64 = lib;
-   }
-   simple_mtx_unlock(&pdev->softfp64_lock);
-   return pdev->softfp64;
-}
-
-/* fp64 to fp32, rounded to odd: truncate, then set the lowest mantissa bit
- * if the result is inexact. Rounding that again to a type with at least two
- * fewer mantissa bits gives the correctly rounded result in any mode. */
-static nir_def *
-kk_f2f32_round_to_odd(nir_builder *b, nir_def *x)
-{
-   nir_def *rte = nir_f2f32(b, x);
-   nir_def *abs_mask = nir_imm_int64(b, INT64_MAX);
-   nir_def *abs_x = nir_iand(b, x, abs_mask);
-   nir_def *abs_rte = nir_iand(b, nir_f2f64(b, rte), abs_mask);
-   nir_def *rtz = nir_bcsel(b, nir_ult(b, abs_x, abs_rte),
-                            nir_iadd_imm(b, rte, -1), rte);
-   return nir_bcsel(b, nir_ine(b, abs_x, abs_rte), nir_ior_imm(b, rtz, 1),
-                    rtz);
-}
-
-/* The float64 library only converts between fp64 and 32 or 64-bit types.
- * Route conversions between fp64 and narrower types through 32 bits. */
-static bool
-kk_widen_fp64_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
-{
-   if (!nir_op_infos[alu->op].is_conversion)
-      return false;
-
-   unsigned src_bits = nir_src_bit_size(alu->src[0].src);
-   unsigned dst_bits = alu->def.bit_size;
-   nir_alu_type src_type =
-      nir_alu_type_get_base_type(nir_op_infos[alu->op].input_types[0]);
-   nir_alu_type dst_type =
-      nir_alu_type_get_base_type(nir_op_infos[alu->op].output_type);
-   bool from_fp64 = src_type == nir_type_float && src_bits == 64;
-   bool to_fp64 = dst_type == nir_type_float && dst_bits == 64;
-
-   b->cursor = nir_before_instr(&alu->instr);
-   nir_def *src = nir_ssa_for_alu_src(b, alu, 0);
-
-   if (from_fp64 && dst_bits < 32 && dst_bits > 1) {
-      if (dst_type == nir_type_float) {
-         /* The op keeps its own rounding mode */
-         src = kk_f2f32_round_to_odd(b, src);
-      } else {
-         nir_alu_type mid_type = dst_type | 32;
-         nir_def *mid = nir_type_convert(b, src, nir_type_float64, mid_type,
-                                         nir_rounding_mode_undef);
-         nir_def_replace(&alu->def,
-                         nir_type_convert(b, mid, mid_type, dst_type | dst_bits,
-                                          nir_rounding_mode_undef));
-         return true;
-      }
-   } else if (to_fp64 && src_bits < 32 && src_bits > 1) {
-      src = nir_type_convert(b, src, src_type | src_bits, src_type | 32,
-                             nir_rounding_mode_undef);
-   } else {
-      return false;
-   }
-
-   nir_src_rewrite(&alu->src[0].src, src);
-   for (unsigned i = 0; i < NIR_MAX_VEC_COMPONENTS; i++)
-      alu->src[0].swizzle[i] = i;
-   return true;
-}
-
-/* Metal has no double type. Replace every fp64 ALU op with calls into the
- * float64 library, which works on the bits as 64-bit integers. */
-static void
-kk_lower_fp64(struct kk_physical_device *pdev, nir_shader *nir)
-{
-   /* nir_lower_doubles takes scalars. Subgroup lowering in msl_preprocess_nir
-    * builds vector ALU after the shader was scalarized. */
-   NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
-   NIR_PASS(_, nir, nir_lower_flrp, 64, false);
-   /* Lowers what the library has no function for (ffma_weak, fmod, ldexp) to
-    * ops it has. */
-   NIR_PASS(_, nir, nir_opt_algebraic);
-   /* After nir_opt_algebraic, which folds the 32-bit detour away */
-   NIR_PASS(_, nir, nir_shader_alu_pass, kk_widen_fp64_conversion,
-            nir_metadata_control_flow, NULL);
-   NIR_PASS(_, nir, nir_lower_doubles, kk_get_softfp64(pdev),
-            nir->options->lower_doubles_options);
-   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
-   NIR_PASS(_, nir, nir_opt_copy_prop);
-   NIR_PASS(_, nir, nir_opt_dce);
-}
-
 static void
 kk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
                   UNUSED const struct vk_pipeline_robustness_state *rs)
@@ -205,8 +87,6 @@ kk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    };
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv_options);
 
-   if (nir->info.bit_sizes_float & 64)
-      kk_lower_fp64(container_of(vk_pdev, struct kk_physical_device, vk), nir);
 }
 
 static bool

@@ -23,9 +23,15 @@ msl_nir_algebraic_c = custom_target(
 )
 
 
+msl_float64_h = custom_target(
+  input : ['msl_float64_gen.py', float64_glsl_file],
+  output : 'msl_float64.h',
+  command : [prog_python, '@INPUT0@', '@INPUT1@', '@OUTPUT@'],
+)
+
 libmsl_compiler = static_library(
     'msl_compiler',
-    [libmsl_compiler_files, msl_nir_algebraic_c],
+    [libmsl_compiler_files, msl_nir_algebraic_c, msl_float64_h],
     dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime],
     gnu_symbol_visibility: 'hidden',
     build_by_default: false,

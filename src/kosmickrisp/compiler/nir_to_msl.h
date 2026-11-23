@@ -109,6 +109,10 @@ bool msl_nir_lower_multisample_alpha(nir_shader *s, bool alpha_to_coverage,
 
 bool msl_gather_uses_per_draw_data(nir_shader *nir);
 
+bool msl_nir_alu_is_fp64(const nir_alu_instr *alu);
+bool msl_nir_lower_fp64(nir_shader *nir);
+
+
 static const nir_shader_compiler_options kk_nir_options = {
    .lower_fdph = true,
    .has_fsub = true,

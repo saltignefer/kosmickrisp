@@ -1319,8 +1319,6 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    if (result != VK_SUCCESS)
       goto fail_disk_cache;
 
-   simple_mtx_init(&pdev->softfp64_lock, mtx_plain);
-
    list_add(&pdev->vk.link, &instance->vk.physical_devices.list);
 
    return VK_SUCCESS;
@@ -1341,8 +1339,6 @@ kk_physical_device_destroy(struct vk_physical_device *vk_pdev)
       container_of(vk_pdev, struct kk_physical_device, vk);
 
    kk_finish_wsi(pdev);
-   ralloc_free(pdev->softfp64);
-   simple_mtx_destroy(&pdev->softfp64_lock);
    kk_physical_device_free_disk_cache(pdev);
    vk_physical_device_finish(&pdev->vk);
    mtl_release(pdev->mtl_dev_handle);

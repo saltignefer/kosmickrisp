@@ -729,6 +729,9 @@ ti_type_to_msl_type(ti_type type, uint8_t bit_width, uint8_t num_components)
          return half_names[num_components - 1];
       case 32:
          return float_names[num_components - 1];
+      case 64:
+         /* fp64 values are the bits of the float64 library */
+         return uint64_names[num_components - 1];
       default:
          assert(!"Bad float length");
       }
@@ -790,6 +793,10 @@ emit_src_component(struct nir_to_msl_ctx *ctx, nir_src *src, unsigned comp)
    ti_type type = get_type(ctx->types, src);
    switch (type) {
    case TYPE_FLOAT: {
+      if (src->ssa->bit_size == 64) {
+         P(ctx, "ulong(0x%" PRIx64 "ul", nir_src_comp_as_uint(*src, comp));
+         break;
+      }
       double v = nir_src_comp_as_float(*src, comp);
       if (v == INFINITY) {
          P(ctx, "(INFINITY");

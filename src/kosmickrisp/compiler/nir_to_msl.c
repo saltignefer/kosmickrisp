@@ -5,6 +5,7 @@
  */
 
 #include "nir_to_msl.h"
+#include "msl_float64.h"
 #include "msl_private.h"
 #include "nir.h"
 #include "nir_builder.h"
@@ -292,9 +293,86 @@ alu_fcmp_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr,
    ALU_BINOP(op);
 }
 
+/* fp64 values are ulong bits. Print fp64 ALU as calls into the float64
+ * library, see msl_float64_gen.py and msl_nir_lower_fp64. */
+static const char *
+fp64_function(const nir_alu_instr *instr)
+{
+   bool src64 = nir_src_bit_size(instr->src[0].src) == 64;
+
+   switch (instr->op) {
+   case nir_op_fadd:
+      return "__fadd64";
+   case nir_op_fmul:
+      return "__fmul64";
+   case nir_op_fmad:
+   case nir_op_ffma:
+   case nir_op_ffma_weak:
+      return "__fmad64";
+   case nir_op_fmin:
+      return "__fmin64";
+   case nir_op_fmax:
+      return "__fmax64";
+   case nir_op_feq:
+      return "__feq64";
+   case nir_op_fneu:
+      return "__fneu64";
+   case nir_op_flt:
+      return "__flt64";
+   case nir_op_fge:
+      return "__fge64";
+   case nir_op_fabs:
+      return "__fabs64";
+   case nir_op_fneg:
+      return "__fneg64";
+   case nir_op_fsign:
+      return "__fsign64";
+   case nir_op_fsat:
+      return "__fsat64";
+   case nir_op_ffloor:
+      return "__ffloor64";
+   case nir_op_ftrunc:
+      return "__ftrunc64";
+   case nir_op_fround_even:
+      return "__fround64";
+   case nir_op_ffract:
+      return "__ffract64";
+   case nir_op_fsqrt:
+      return "__fsqrt64";
+   case nir_op_fisfinite:
+      return "__fisfinite64";
+   case nir_op_f2f64:
+      return "__fp32_to_fp64";
+   case nir_op_f2f32:
+      return "__fp64_to_fp32";
+   case nir_op_f2i32:
+      return "__fp64_to_int";
+   case nir_op_f2u32:
+      return "__fp64_to_uint";
+   case nir_op_f2i64:
+      return "__fp64_to_int64";
+   case nir_op_f2u64:
+      return "__fp64_to_uint64";
+   case nir_op_i2f64:
+      return src64 ? "__int64_to_fp64" : "__int_to_fp64";
+   case nir_op_u2f64:
+      return src64 ? "__uint64_to_fp64" : "__uint_to_fp64";
+   case nir_op_b2f64:
+      return "__bool_to_fp64";
+   default:
+      fprintf(stderr, "Unsupported fp64 op %s\n", nir_op_infos[instr->op].name);
+      UNREACHABLE("fp64 op not lowered by msl_nir_lower_fp64");
+   }
+}
+
 static void
 alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
 {
+   if (msl_nir_alu_is_fp64(instr)) {
+      alu_funclike(ctx, instr, fp64_function(instr));
+      return;
+   }
+
    switch (instr->op) {
    case nir_op_isign:
       alu_src_to_msl(ctx, instr, 0);
@@ -2407,6 +2485,10 @@ alu_fp_math_mode_pragma(struct nir_to_msl_ctx *ctx, const nir_alu_instr *alu)
 {
    unsigned fp_math_ctrl = alu->fp_math_ctrl;
 
+   /* fp64 ALU are calls into the integer float64 library */
+   if (msl_nir_alu_is_fp64(alu))
+      return NULL;
+
    /* TODO_KOSMICKRISP Investigate why bcsel do not have inf nan preserve */
    if (alu->op == nir_op_bcsel) {
       for (unsigned i = 0; i < 3; i++) {
@@ -2769,6 +2851,8 @@ msl_optimize_nir(struct nir_shader *nir)
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, kk_scalarize_filter,
                NULL);
    } while (progress);
+   NIR_PASS(_, nir, msl_nir_lower_fp64);
+   NIR_PASS(_, nir, nir_opt_dce);
    /* nir_opt_shrink_stores needs to go after nir_opt_remove_phis since
     * writes may be dependent on phis. We could have a situation such that the
     * stored vector can be (valid,undef,undef,undef) or
@@ -2960,6 +3044,19 @@ msl_emit_constant_data(struct nir_to_msl_ctx *ctx, nir_shader *shader)
    P(ctx, "};\n");
 }
 
+static bool
+shader_uses_fp64(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_alu &&
+             msl_nir_alu_is_fp64(nir_instr_as_alu(instr)))
+            return true;
+      }
+   }
+   return false;
+}
+
 char *
 nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
 {
@@ -2983,6 +3080,14 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
       P(&ctx, "#include <metal_compute>\n");
    P(&ctx, "#include <metal_stdlib>\n");
    P(&ctx, "using namespace metal;\n");
+   if (shader_uses_fp64(impl)) {
+      P(&ctx, "#define FLOAT_ROUNDING_MODE %u\n",
+        nir_is_rounding_mode_rtz(shader->info.float_controls_execution_mode,
+                                 64)
+           ? 1u
+           : 0u);
+      P(&ctx, "%s", msl_float64_library);
+   }
 
    msl_emit_constant_data(&ctx, shader);
 
