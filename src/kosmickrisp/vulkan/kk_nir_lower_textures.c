@@ -97,15 +97,10 @@ static void
 lower_cube_image_intrin(nir_builder *b, nir_intrinsic_instr *intrin)
 {
    assert(nir_intrinsic_image_dim(intrin) == GLSL_SAMPLER_DIM_CUBE);
+   /* Cube and cube array images address faces as 2D array layers already:
+    * the third coordinate is layer * 6 + face, see
+    * glsl_get_sampler_coordinate_components */
    nir_def *coord = intrin->src[1].ssa;
-   if (nir_intrinsic_image_array(intrin)) {
-      assert(coord->num_components >= 4);
-      nir_def *layer_index =
-         nir_iadd(b, nir_channel(b, coord, 2),
-                  nir_imul_imm(b, nir_channel(b, coord, 3), 6));
-      coord = nir_vec4(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1),
-                       layer_index, nir_imm_intN_t(b, 0, coord->bit_size));
-   }
    nir_src_rewrite(&intrin->src[1], nir_pad_vector(b, coord, 4));
    nir_intrinsic_set_image_dim(intrin, GLSL_SAMPLER_DIM_2D);
    nir_intrinsic_set_image_array(intrin, true);
