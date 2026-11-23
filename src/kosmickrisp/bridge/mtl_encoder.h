@@ -19,6 +19,13 @@ void mtl_barrier_after_encoder_stages(void *encoder,
                                       enum mtl_stages after_stages,
                                       enum mtl_stages before_queue_stages);
 
+/* Also makes device memory writes of after_stages visible to before_stages,
+ * which lets shaders of one draw consume data of an earlier draw in the same
+ * render pass */
+void mtl_barrier_after_encoder_stages_device(void *encoder,
+                                             enum mtl_stages after_stages,
+                                             enum mtl_stages before_stages);
+
 void mtl_barrier_after_queue_stages(void *encoder,
                                     enum mtl_stages after_queue_stages,
                                     enum mtl_stages before_stages);

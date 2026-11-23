@@ -804,6 +804,205 @@ kk_nir_lower_mesh_grid(nir_shader *nir)
    return progress;
 }
 
+/* Stores the group counts and the payload of a task grid in an entry of the
+ * kk_task_grid of the draw, see struct kk_task_grid. Invocation 0 runs this
+ * after all invocations wrote the payload. */
+static void
+store_task_grid(nir_builder *b, nir_def *dims)
+{
+   uint32_t payload_size = ALIGN_POT(b->shader->info.task_payload_size, 16u);
+   uint32_t stride = kk_task_grid_slot_stride(payload_size);
+
+   nir_def *per_draw = nir_load_per_draw_ptr_kk(b, 1, 64);
+   nir_def *grid = nir_load_global(
+      b, 1, 64,
+      nir_iadd_imm(b, per_draw,
+                   offsetof(struct kk_per_draw_data, task_grid_addr)),
+      .align_mul = 8);
+   nir_def *entry = nir_global_atomic(
+      b, 32, nir_iadd_imm(b, grid, offsetof(struct kk_task_grid, claimed)),
+      nir_imm_int(b, 1), .atomic_op = nir_atomic_op_iadd);
+
+   nir_push_if(b, nir_ult_imm(b, entry, KK_TASK_GRID_MAX_ENTRIES));
+   {
+      /* Only stored entries add work to the second draw */
+      nir_global_atomic(
+         b, 32, grid,
+         nir_imul_imm(b, nir_iadd_imm(b, entry, 1), KK_MESH_GRID_MAX_CHUNKS),
+         .atomic_op = nir_atomic_op_umax);
+      nir_def *pool = nir_load_global(
+         b, 1, 64,
+         nir_iadd_imm(b, grid, offsetof(struct kk_task_grid, pool_addr)),
+         .align_mul = 8);
+      nir_def *slot = nir_global_atomic(
+         b, 32,
+         nir_iadd_imm(b, pool, offsetof(struct kk_task_grid_pool, claimed)),
+         nir_imm_int(b, 1), .atomic_op = nir_atomic_op_iadd);
+      nir_def *slot_count = nir_load_global(
+         b, 1, 32,
+         nir_iadd_imm(b, pool, offsetof(struct kk_task_grid_pool, slot_count)),
+         .align_mul = 4);
+      nir_def *valid = nir_ult(b, slot, slot_count);
+
+      nir_def *entry_offset = nir_iadd_imm(
+         b, nir_imul_imm(b, entry, 4), offsetof(struct kk_task_grid, slots));
+      nir_store_global(b, nir_bcsel(b, valid, slot, nir_imm_int(b, ~0)),
+                       nir_iadd(b, grid, nir_u2u64(b, entry_offset)),
+                       .align_mul = 4);
+
+      nir_push_if(b, valid);
+      {
+         nir_def *addr = nir_iadd(
+            b, pool,
+            nir_u2u64(b, nir_iadd_imm(b, nir_imul_imm(b, slot, stride),
+                                      sizeof(struct kk_task_grid_pool))));
+         nir_store_global(b, dims, addr, .align_mul = 16);
+
+         /* Copy the payload a vec4 at a time */
+         if (payload_size > 0u) {
+            nir_variable *offset_var = nir_local_variable_create(
+               b->impl, glsl_uint_type(), "task_grid_offset");
+            nir_store_var(b, offset_var, nir_imm_int(b, 0), 0x1);
+            nir_push_loop(b);
+            {
+               nir_def *offset = nir_load_var(b, offset_var);
+               nir_break_if(b, nir_uge_imm(b, offset, payload_size));
+               nir_def *value =
+                  nir_load_task_payload(b, 4, 32, offset, .align_mul = 16);
+               nir_store_global(
+                  b, value,
+                  nir_iadd(
+                     b, addr,
+                     nir_u2u64(
+                        b, nir_iadd_imm(b, offset, KK_TASK_GRID_SLOT_PAYLOAD))),
+                  .align_mul = 16);
+               nir_store_var(b, offset_var, nir_iadd_imm(b, offset, 16), 0x1);
+            }
+            nir_pop_loop(b, NULL);
+         }
+      }
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+}
+
+/* Whether a launch may emit a grid Metal drops. Grids the shader provably
+ * keeps small launch natively. A component never exceeds
+ * maxMeshWorkGroupCount, so only launches with two or more unbounded
+ * components need the task grid path. */
+static bool
+launch_may_need_task_grid(nir_shader *nir, struct hash_table *range_ht,
+                          nir_intrinsic_instr *launch)
+{
+   nir_def *dims = launch->src[0].ssa;
+   uint64_t bound = 1u;
+   for (unsigned c = 0; c < 3; c++) {
+      uint32_t max =
+         nir_unsigned_upper_bound(nir, range_ht, nir_get_scalar(dims, c));
+      bound *= MIN2(max, KK_MESH_WORK_GROUP_COUNT);
+   }
+   return bound >= KK_MESH_GRID_NATIVE_GROUPS;
+}
+
+static void
+lower_task_grid_launch(nir_builder *b, nir_intrinsic_instr *launch)
+{
+   b->cursor = nir_before_instr(&launch->instr);
+   nir_def *dims = launch->src[0].ssa;
+   nir_def *total = nir_imul(b, nir_u2u64(b, nir_channel(b, dims, 0)),
+                             nir_imul(b, nir_u2u64(b, nir_channel(b, dims, 1)),
+                                      nir_u2u64(b, nir_channel(b, dims, 2))));
+   nir_def *oversized = nir_uge_imm(b, total, KK_MESH_GRID_NATIVE_GROUPS);
+
+   /* Launches happen in workgroup uniform control flow, so all invocations
+    * get here. Make their payload writes visible to invocation 0. */
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_task_payload);
+
+   nir_push_if(b,
+               nir_iand(b, oversized,
+                        nir_ieq_imm(b, nir_load_local_invocation_index(b), 0)));
+   store_task_grid(b, dims);
+   nir_pop_if(b, NULL);
+
+   nir_src_rewrite(&launch->src[0],
+                   nir_bcsel(b, oversized, nir_imm_zero(b, 3, 32), dims));
+}
+
+/* Sends task grids Metal would drop through the task grid pipeline, see
+ * struct kk_task_grid. Returns whether the shader may emit such a grid. */
+bool
+kk_nir_lower_task_grid(nir_shader *nir)
+{
+   assert(nir->info.stage == MESA_SHADER_TASK);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+
+   /* Decide before changing the control flow the range analysis walks */
+   struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
+   struct util_dynarray launches;
+   util_dynarray_init(&launches, NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_launch_mesh_workgroups &&
+             launch_may_need_task_grid(nir, range_ht, intr))
+            util_dynarray_append(&launches, intr);
+      }
+   }
+   _mesa_hash_table_destroy(range_ht, NULL);
+
+   nir_builder b = nir_builder_create(impl);
+   util_dynarray_foreach(&launches, nir_intrinsic_instr *, launch)
+      lower_task_grid_launch(&b, *launch);
+
+   bool progress =
+      util_dynarray_num_elements(&launches, nir_intrinsic_instr *) > 0;
+   util_dynarray_fini(&launches);
+   return nir_progress(progress, impl, nir_metadata_none);
+}
+
+static bool
+lower_mesh_task_grid_payload(nir_builder *b, nir_intrinsic_instr *intr,
+                             UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_task_payload)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *slot =
+      nir_load_task_payload(b, 1, 64, nir_imm_int(b, 0),
+                            .base = KK_MESH_GRID_PAYLOAD_SLOT, .align_mul = 8);
+   nir_def *offset =
+      nir_iadd_imm(b, intr->src[0].ssa,
+                   nir_intrinsic_base(intr) + KK_TASK_GRID_SLOT_PAYLOAD);
+   /* Slot payloads are 16 byte aligned like the payload */
+   uint32_t align_mul = MIN2(nir_intrinsic_align_mul(intr), 16u);
+   nir_def *value = nir_load_global(
+      b, intr->def.num_components, intr->def.bit_size,
+      nir_iadd(b, slot, nir_u2u64(b, offset)), .align_mul = align_mul,
+      .align_offset = nir_intrinsic_align_offset(intr) % align_mul);
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
+/* The mesh shader variant of the task grid pipeline, see struct kk_task_grid,
+ * reads the payload from the slot whose address the object stage passes, and
+ * runs in chunks like mesh shaders without task shader. */
+bool
+kk_nir_lower_mesh_task_grid(nir_shader *nir)
+{
+   assert(nir->info.stage == MESA_SHADER_MESH);
+   /* Before kk_nir_lower_mesh_grid adds payload loads of its own */
+   nir_shader_intrinsics_pass(nir, lower_mesh_task_grid_payload,
+                              nir_metadata_control_flow, NULL);
+   kk_nir_lower_mesh_grid(nir);
+   return true;
+}
+
 /* Lowering for the mesh stage, the counterpart of kk_lower_hw_vs */
 static void
 kk_lower_hw_mesh(nir_shader *nir)
@@ -1294,6 +1493,9 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
 
       /* Graphics pipeline. */
       mtl_release(pipe->gfx.render);
+      if (pipe->gfx.task_grid)
+         mtl_release(pipe->gfx.task_grid);
+      pipe->gfx.task_grid = NULL;
       if (pipe->gfx.ds_handle)
          mtl_release(pipe->gfx.ds_handle);
       pipe->gfx.render = NULL;
@@ -1694,6 +1896,12 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       /* Descriptors were lowered with the GS, this lowers the system values
        * the hardware vertex lowering added */
       NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL);
+   } else if (stage == MESA_SHADER_TASK) {
+      /* After nir_lower_task_shader, which finalizes the payload */
+      bool task_grid = false;
+      NIR_PASS(task_grid, nir, kk_nir_lower_task_grid);
+      shader->info.mesh.task_grid = task_grid;
+      shader->info.uses_per_draw_data |= task_grid;
    } else if (stage == MESA_SHADER_MESH) {
       /* After varying linking, which only allows output loads in the TCS.
        * The system values the position fixups read get lowered here. */
@@ -1703,6 +1911,14 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                key.viewport_z);
       if (progress)
          NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL);
+
+      /* The task grid pipeline runs a variant, see struct kk_task_grid */
+      if (prev_stage && prev_stage->info.mesh.task_grid) {
+         shader->info.mesh.task_grid = true;
+         nir_shader *variant = nir_shader_clone(NULL, nir);
+         NIR_PASS(_, variant, kk_nir_lower_mesh_task_grid);
+         kk_compile_msl(pdev, variant, state, &shader->mesh_task_grid, false);
+      }
    }
 
    /* KK_WORKAROUND_19 Only the stage that feeds geometry will be dispatched
@@ -2017,6 +2233,8 @@ gather_graphics_pipeline_create_info(
       if (s->info.stage == MESA_SHADER_MESH) {
          info->mesh.mesh_local_size = s->info.mesh.mesh_local_size;
          info->mesh.primitive_type = s->info.mesh.primitive_type;
+         if (s->info.mesh.task_grid)
+            kk_msl_copy(&vs->mesh_task_grid, &s->mesh_task_grid);
       }
    }
 
@@ -2080,6 +2298,8 @@ kk_compile_mesh_pipeline(struct kk_device *device, struct kk_shader *holder)
    mtl_library *libraries[ARRAY_SIZE(stages)] = {NULL};
    mtl_function_descriptor *functions[ARRAY_SIZE(stages)] = {NULL};
    mtl_mesh_render_pipeline_descriptor *descriptor = NULL;
+   mtl_library *task_grid_library = NULL;
+   mtl_function_descriptor *task_grid_functions[2] = {NULL};
 
    uint32_t stages_bits =
       info->vs.additional_stages_bits | BITFIELD_BIT(info->stage);
@@ -2137,12 +2357,51 @@ kk_compile_mesh_pipeline(struct kk_device *device, struct kk_shader *holder)
 
    pipe->gfx.render =
       mtl_new_render_pipeline(device->mtl_compiler_handle, descriptor);
-   if (pipe->gfx.render == NULL)
+   if (pipe->gfx.render == NULL) {
       result = VK_ERROR_INVALID_SHADER_NV;
+      goto cleanup;
+   }
+
+   /* The task grid pipeline swaps in the object stage that runs task grids
+    * and the matching mesh shader variant, see struct kk_task_grid */
+   if (info->mesh.task_grid) {
+      const struct msl_compile_data *data = &holder->mesh_task_grid;
+      task_grid_library = mtl_new_library(
+         device->mtl_compiler_handle, data->code, pdev->info.msl_version,
+         MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+      if (task_grid_library == NULL) {
+         result = VK_ERROR_INVALID_SHADER_NV;
+         goto cleanup;
+      }
+      task_grid_functions[0] = mtl_new_library_function_descriptor(
+         device->mesh_grid_object, "kk_task_grid_object");
+      task_grid_functions[1] = mtl_new_library_function_descriptor(
+         task_grid_library, data->entrypoint_name);
+
+      mtl_mesh_render_pipeline_descriptor_set_object_shader(
+         descriptor, task_grid_functions[0]);
+      mtl_mesh_render_pipeline_descriptor_set_mesh_shader(
+         descriptor, task_grid_functions[1]);
+      mtl_mesh_render_pipeline_descriptor_set_threads_per_threadgroup(
+         descriptor, (struct mtl_size){1u, 1u, 1u}, info->mesh.mesh_local_size);
+      mtl_mesh_render_pipeline_descriptor_set_payload_length(
+         descriptor, KK_MESH_GRID_PAYLOAD_SIZE);
+
+      pipe->gfx.task_grid =
+         mtl_new_render_pipeline(device->mtl_compiler_handle, descriptor);
+      if (pipe->gfx.task_grid == NULL)
+         result = VK_ERROR_INVALID_SHADER_NV;
+   }
 
 cleanup:
    if (descriptor)
       mtl_release(descriptor);
+   for (uint32_t i = 0u; i < ARRAY_SIZE(task_grid_functions); ++i) {
+      if (task_grid_functions[i])
+         mtl_release(task_grid_functions[i]);
+   }
+   if (task_grid_library)
+      mtl_release(task_grid_library);
    for (uint32_t i = 0u; i < ARRAY_SIZE(stages); ++i) {
       if (functions[i])
          mtl_release(functions[i]);
@@ -2600,6 +2859,16 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    return result;
 }
 
+/* A mesh shader whose task shader may emit task grids and the task shader
+ * holding its pipeline also carry the mesh variant for task grids. */
+static bool
+kk_has_mesh_task_grid(const struct kk_shader_info *info)
+{
+   return info->mesh.task_grid &&
+          (info->stage == MESA_SHADER_MESH ||
+           (info->stage == MESA_SHADER_TASK && info->holds_pipeline));
+}
+
 /* A GS and the VS holding its pipeline also carry the GS compute pass. */
 static bool
 kk_has_gs_main(const struct kk_shader_info *info)
@@ -2636,6 +2905,8 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
    }
    if (kk_has_gs_main(&shader->info))
       kk_msl_serialize(&shader->gs_main, blob);
+   if (kk_has_mesh_task_grid(&shader->info))
+      kk_msl_serialize(&shader->mesh_task_grid, blob);
 
    return !blob->out_of_memory;
 }
@@ -2696,6 +2967,12 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
 
    if (kk_has_gs_main(&info)) {
       result = kk_msl_deserialize(blob, &shader->gs_main);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
+
+   if (kk_has_mesh_task_grid(&info)) {
+      result = kk_msl_deserialize(blob, &shader->mesh_task_grid);
       if (result != VK_SUCCESS)
          goto fail;
    }

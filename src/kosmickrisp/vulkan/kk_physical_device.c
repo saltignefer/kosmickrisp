@@ -896,12 +896,12 @@ kk_get_device_properties(
        * mesh grids of 2^20 threadgroups or more, from draws and from object
        * functions alike. The object grid of a draw has no such limit, so
        * draws without task shader launch their grid in chunks, see
-       * KK_MESH_GRID_MAX_CHUNKS, but the grid a task workgroup emits stays a
-       * single Metal grid, which bounds the mesh workgroup count. Some of
-       * these values are below the Vulkan minimums, which is why mesh
-       * shaders are experimental. Multiview draws once per view, see
-       * kk_draw_mesh, but render pass clears go through vertex amplification,
-       * which bounds the view count. */
+       * KK_MESH_GRID_MAX_CHUNKS, and a draw whose task shader may emit such a
+       * grid runs those grids in chunks from a second draw, see struct
+       * kk_task_grid. Some of these values are below the Vulkan minimums,
+       * which is why mesh shaders are experimental. Multiview draws once per
+       * view, see kk_draw_mesh, but render pass clears go through vertex
+       * amplification, which bounds the view count. */
       .maxTaskWorkGroupTotalCount = 1u << 22,
       .maxTaskWorkGroupCount = {65535, 65535, 65535},
       .maxTaskWorkGroupInvocations = 128,
@@ -909,7 +909,7 @@ kk_get_device_properties(
       .maxTaskPayloadSize = 16384,
       .maxTaskSharedMemorySize = 32752 - a64_tg_locks_B,
       .maxTaskPayloadAndSharedMemorySize = 32752 - a64_tg_locks_B,
-      .maxMeshWorkGroupTotalCount = (1u << 20) - 1u,
+      .maxMeshWorkGroupTotalCount = 1u << 22,
       .maxMeshWorkGroupCount = {65535, 65535, 65535},
       .maxMeshWorkGroupInvocations = 256,
       .maxMeshWorkGroupSize = {256, 256, 256},

@@ -62,10 +62,65 @@ kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
 #define KK_MESH_GRID_MAX_CHUNKS   8u
 #define KK_MESH_GRID_CHUNK_GROUPS ((1u << 20) - 1u)
 
-/* Synthetic payload: uint base_y, uint base_z, packed_uint3 group counts */
+/* Synthetic payload: uint base_y, uint base_z, packed_uint3 group counts and,
+ * for task grids, the address of the task grid slot */
 #define KK_MESH_GRID_PAYLOAD_BASE   0u
 #define KK_MESH_GRID_PAYLOAD_COUNTS 8u
+#define KK_MESH_GRID_PAYLOAD_SLOT   24u
 #define KK_MESH_GRID_PAYLOAD_SIZE   32u
+
+/* Mesh grids of fewer threadgroups always run, see KK_MESH_GRID_MAX_CHUNKS */
+#define KK_MESH_GRID_NATIVE_GROUPS (1u << 20)
+/* maxTaskWorkGroupCount and maxMeshWorkGroupCount, per dimension */
+#define KK_MESH_WORK_GROUP_COUNT 65535u
+
+/* A task workgroup emits a single Metal mesh grid, so a grid of
+ * KK_MESH_GRID_NATIVE_GROUPS or more, a task grid, goes through a second draw.
+ * Invocation 0 of the workgroup claims an entry of the kk_task_grid of the
+ * draw and a slot of the kk_task_grid_pool shared by the draws of a command,
+ * stores the group counts and the payload in the slot and adds
+ * KK_MESH_GRID_MAX_CHUNKS object threadgroups to the draw arguments of the
+ * kk_task_grid. The workgroup then launches no mesh grid, see
+ * kk_nir_lower_task_grid. After a barrier, the second draw runs the task grid
+ * pipeline: object threadgroup j launches chunk j % KK_MESH_GRID_MAX_CHUNKS of
+ * entry j / KK_MESH_GRID_MAX_CHUNKS, and a variant of the mesh shader reads the
+ * payload from the slot, see kk_nir_lower_mesh_task_grid. The second draw
+ * frees the slots for the next draw. Writing the draw arguments of a draw
+ * while it runs hangs the GPU at times, so a draw of the task grid pipeline
+ * before the first draw of a command resets the counters, see kk_draw_mesh.
+ * Grids beyond the entries of a draw get dropped.
+ *
+ * Primitives of task grids rasterize after those of all task workgroups of
+ * the draw, while Vulkan orders mesh workgroups by their task workgroup.
+ */
+#define KK_TASK_GRID_MAX_ENTRIES 6u
+
+struct kk_task_grid {
+   /* Draw arguments of the second draw, X counts stored entries times
+    * KK_MESH_GRID_MAX_CHUNKS */
+   uint32_t draw[3];
+   /* Entries claimed, which may exceed KK_TASK_GRID_MAX_ENTRIES */
+   uint32_t claimed;
+   uint64_t pool_addr;
+   /* Slot of each entry, ~0 when the pool ran out */
+   uint32_t slots[KK_TASK_GRID_MAX_ENTRIES];
+};
+
+/* Followed by the slots: uint group counts[3], padding, then the payload */
+struct kk_task_grid_pool {
+   uint32_t claimed;
+   uint32_t slot_count;
+   uint32_t slot_stride;
+   uint32_t pad;
+};
+
+#define KK_TASK_GRID_SLOT_PAYLOAD 16u
+
+static inline uint32_t
+kk_task_grid_slot_stride(uint32_t payload_size)
+{
+   return KK_TASK_GRID_SLOT_PAYLOAD + ALIGN_POT(payload_size, 16u);
+}
 
 /* Chunks of a grid, must match the synthetic object stage. Grids beyond the
  * limits get the chunks of the largest grid. */
@@ -110,6 +165,9 @@ struct kk_shader_info {
       enum mesa_prim primitive_type;
       /* Bytes of payload the task shader writes */
       uint32_t payload_size;
+      /* The task shader may emit grids the task grid pipeline runs, see
+       * struct kk_task_grid. Set on the task and mesh shaders. */
+      bool task_grid;
    } mesh;
 
    union {
@@ -182,6 +240,8 @@ struct kk_pipeline_handles {
          mtl_compute_pipeline_state *pre_render[4];
          mtl_depth_stencil_state *ds_handle;
          uint32_t pre_render_count;
+         /* Runs task grids, see struct kk_task_grid */
+         mtl_render_pipeline_state *task_grid;
       } gfx;
       mtl_compute_pipeline_state *cs;
    };
@@ -198,9 +258,14 @@ struct kk_shader {
    struct kk_pipeline_handles pipeline;
    struct kk_shader_info info;
    struct msl_compile_data msl_data[MESA_SHADER_MESH_STAGES];
-   /* Compute pass of a GS. Its rasterization VS is in
-    * msl_data[MESA_SHADER_GEOMETRY]. */
-   struct msl_compile_data gs_main;
+   union {
+      /* Compute pass of a GS. Its rasterization VS is in
+       * msl_data[MESA_SHADER_GEOMETRY]. */
+      struct msl_compile_data gs_main;
+      /* Mesh shader variant that runs task grids, see struct kk_task_grid.
+       * Freed through gs_main. */
+      struct msl_compile_data mesh_task_grid;
+   };
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
@@ -234,6 +299,8 @@ bool kk_nir_add_device_barrier_workaround(nir_shader *nir);
 bool kk_nir_lower_poly(struct nir_shader *nir);
 bool kk_nir_lower_mesh_queries(nir_shader *nir);
 bool kk_nir_lower_mesh_grid(nir_shader *nir);
+bool kk_nir_lower_task_grid(nir_shader *nir);
+bool kk_nir_lower_mesh_task_grid(nir_shader *nir);
 bool kk_nir_lower_null_images(nir_shader *nir);
 
 bool kk_nir_lower_textures(nir_shader *nir);

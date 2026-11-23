@@ -111,8 +111,8 @@ struct kk_device {
    /* Locks of 64-bit atomics, see MSL_ATOMIC64_LOCKS */
    struct kk_bo *atomic64_locks;
 
-   /* Object stage of mesh pipelines without task shader, see
-    * KK_MESH_GRID_MAX_CHUNKS */
+   /* Object stages of mesh pipelines without task shader and of task grids,
+    * see KK_MESH_GRID_MAX_CHUNKS */
    mtl_library *mesh_grid_object;
    util_once_flag heap_init_once;
 

@@ -47,6 +47,19 @@ mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
 }
 
 void
+mtl_barrier_after_encoder_stages_device(void *encoder,
+                                        enum mtl_stages after_stages,
+                                        enum mtl_stages before_stages)
+{
+   @autoreleasepool {
+      id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+      [enc barrierAfterEncoderStages:(MTLStages)after_stages
+                 beforeEncoderStages:(MTLStages)before_stages
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+   }
+}
+
+void
 mtl_barrier_after_queue_stages(void *encoder,
                                enum mtl_stages after_queue_stages,
                                enum mtl_stages before_stages)

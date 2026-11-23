@@ -2759,6 +2759,64 @@ kk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
    kk_draw(cmd, &data);
 }
 
+/* Allocates and resets the kk_task_grid of every draw and view and the pool
+ * they share, see struct kk_task_grid. Returns the address of the first
+ * kk_task_grid, or 0 on allocation failure. */
+static uint64_t
+kk_task_grid_prepare(struct kk_cmd_buffer *cmd,
+                     const struct kk_draw_command *data, uint32_t view_mask,
+                     struct mtl_size mesh_threads)
+{
+   struct kk_shader *pipeline_shader = kk_gfx_pipeline_shader(cmd);
+   const struct kk_shader_info *info = &pipeline_shader->info;
+
+   uint32_t views = view_mask ? util_bitcount(view_mask) : 1u;
+   uint32_t grid_count = data->draw_count * views;
+   uint32_t stride = kk_task_grid_slot_stride(info->mesh.payload_size);
+
+   /* Each second draw frees the slots for the next draw, so one draw worth */
+   uint32_t slot_count = KK_TASK_GRID_MAX_ENTRIES;
+
+   struct kk_ptr grids =
+      kk_pool_alloc(cmd, grid_count * sizeof(struct kk_task_grid), 16u);
+   struct kk_ptr pool = kk_pool_alloc(
+      cmd, sizeof(struct kk_task_grid_pool) + slot_count * stride, 16u);
+   if (unlikely(!grids.gpu || !pool.gpu))
+      return 0u;
+
+   struct kk_task_grid_pool *pool_cpu = pool.cpu;
+   *pool_cpu = (struct kk_task_grid_pool){
+      .slot_count = slot_count,
+      .slot_stride = stride,
+   };
+   struct kk_task_grid *grids_cpu = grids.cpu;
+   for (uint32_t i = 0u; i < grid_count; i++) {
+      grids_cpu[i] = (struct kk_task_grid){
+         .draw = {0u, 1u, 1u},
+         .pool_addr = pool.gpu,
+      };
+   }
+
+   /* The draw arguments and the claimed slots count up while the command
+    * buffer runs, so reset them on the GPU for each submission */
+   struct kk_per_draw_data *per_draw = &cmd->state.gfx.per_draw_data;
+   per_draw->task_grid_addr = grids.gpu;
+   per_draw->task_grid_reset = grid_count;
+   struct kk_draw_data draw_data = {};
+   kk_upload_per_draw_data(cmd, BITFIELD_BIT(MESA_SHADER_TASK), 0u, &draw_data,
+                           false);
+
+   mtl_render_encoder *enc = cs_get_render(cmd);
+   mtl_render_set_pipeline_state(enc, pipeline_shader->pipeline.gfx.task_grid);
+   mtl_draw_mesh_threadgroups(enc, (struct mtl_size){grid_count, 1u, 1u},
+                              (struct mtl_size){1u, 1u, 1u}, mesh_threads);
+   mtl_render_set_pipeline_state(enc, pipeline_shader->pipeline.gfx.render);
+   mtl_barrier_after_encoder_stages_device(enc, MTL_STAGE_OBJECTS,
+                                           MTL_STAGE_OBJECTS);
+
+   return grids.gpu;
+}
+
 static void
 kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
@@ -2803,6 +2861,9 @@ kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    if (chunked)
       upload_mask |= BITFIELD_BIT(MESA_SHADER_TASK);
 
+   /* Task grids run in a second draw, see struct kk_task_grid */
+   bool task_grid = !chunked && info->mesh.task_grid;
+
    struct kk_per_draw_data *per_draw = &cmd->state.gfx.per_draw_data;
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2821,6 +2882,20 @@ kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       kk_cmd_set_view_amplification(cmd, false);
 
    mtl_render_encoder *enc = cs_get_render(cmd);
+   uint64_t grids_addr = 0u;
+   if (task_grid) {
+      /* The task shader writes to the grids, so skip the draw without them.
+       * kk_pool_alloc recorded the error. */
+      grids_addr = kk_task_grid_prepare(cmd, data, view_mask, mesh_threads);
+      if (!grids_addr) {
+         if (view_mask)
+            kk_cmd_set_view_amplification(cmd, true);
+         return;
+      }
+   }
+   per_draw->task_grid_reset = 0u;
+
+   uint32_t grid_index = 0u;
    for (uint32_t i = 0; i < data->draw_count; i++) {
       uint64_t addr = 0u;
       if (data->indirect)
@@ -2829,6 +2904,12 @@ kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       per_draw->mesh_grid_addr = chunked ? addr : 0u;
 
       u_foreach_bit(view, view_mask ? view_mask : 1u) {
+         uint64_t grid_addr = 0u;
+         if (task_grid) {
+            grid_addr = grids_addr + grid_index++ * sizeof(struct kk_task_grid);
+            per_draw->task_grid_addr = grid_addr;
+         }
+
          if (upload_mask) {
             struct kk_draw_data draw_data = {};
             per_draw->view_index = view;
@@ -2850,6 +2931,22 @@ kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
                .z = draw->groupCountZ,
             };
             mtl_draw_mesh_threadgroups(enc, grid, task_threads, mesh_threads);
+         }
+
+         if (task_grid) {
+            /* The task workgroups wrote the draw arguments, the entries and
+             * the slots */
+            mtl_barrier_after_encoder_stages_device(
+               enc, MTL_STAGE_OBJECTS, MTL_STAGE_OBJECTS | MTL_STAGE_MESH);
+            mtl_render_set_pipeline_state(
+               enc, pipeline_shader->pipeline.gfx.task_grid);
+            mtl_draw_mesh_threadgroups_indirect(
+               enc, grid_addr, (struct mtl_size){1u, 1u, 1u}, mesh_threads);
+            mtl_render_set_pipeline_state(enc,
+                                          pipeline_shader->pipeline.gfx.render);
+            /* The next draw reuses the slots the second draw read */
+            mtl_barrier_after_encoder_stages_device(
+               enc, MTL_STAGE_OBJECTS | MTL_STAGE_MESH, MTL_STAGE_OBJECTS);
          }
       }
    }
