@@ -1196,6 +1196,20 @@ mesh_distance_ref(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
    return true;
 }
 
+/* A 16-bit access to a component holding two packed 16-bit values. Accesses
+ * the raw bits of its half of the 32-bit member. */
+static bool
+mesh_packed16_access(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
+                     uint32_t location)
+{
+   unsigned bit_size = nir_intrinsic_infos[instr->intrinsic].has_dest
+                          ? instr->def.bit_size
+                          : instr->src[0].ssa->bit_size;
+   return bit_size == 16 && (ctx->outputs_info[location].packed16_mask &
+                             BITFIELD_RANGE(nir_intrinsic_component(instr),
+                                            instr->num_components));
+}
+
 static void
 mesh_store_output_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
 {
@@ -1225,6 +1239,26 @@ mesh_store_output_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P(ctx, " = bool(");
       src_to_msl(ctx, &instr->src[0]);
       P(ctx, ");\n");
+      return;
+   }
+
+   if (mesh_packed16_access(ctx, instr, location)) {
+      unsigned shift = io.high_16bits ? 16u : 0u;
+      u_foreach_bit(i, write_mask) {
+         P_INDENT(ctx);
+         mesh_output_ref(ctx, instr, location, component + i);
+         if (msl_output_num_components(ctx, location) > 1u)
+            P(ctx, ".%c", "xyzw"[component + i]);
+         P(ctx, " = (");
+         mesh_output_ref(ctx, instr, location, component + i);
+         if (msl_output_num_components(ctx, location) > 1u)
+            P(ctx, ".%c", "xyzw"[component + i]);
+         P(ctx, " & 0x%xu) | (uint(as_type<ushort>(", ~(0xffffu << shift));
+         src_to_msl(ctx, &instr->src[0]);
+         if (num_components > 1u)
+            P(ctx, ".%c", "xyzw"[i]);
+         P(ctx, ")) << %uu);\n", shift);
+      }
       return;
    }
 
@@ -1278,6 +1312,21 @@ mesh_load_output_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P(ctx, "%s(", msl_type_for_def(ctx->types, &instr->def));
       mesh_distance_ref(ctx, instr, location);
       P(ctx, ");\n");
+      return;
+   }
+
+   if (mesh_packed16_access(ctx, instr, location)) {
+      unsigned shift = nir_intrinsic_io_semantics(instr).high_16bits ? 16u : 0u;
+      P(ctx, "as_type<%s>(%s(", msl_type_for_def(ctx->types, &instr->def),
+        msl_uint_type(16, instr->num_components));
+      for (unsigned i = 0; i < instr->num_components; i++) {
+         P(ctx, "%sushort(", i ? ", " : "");
+         mesh_output_ref(ctx, instr, location, component + i);
+         if (msl_output_num_components(ctx, location) > 1u)
+            P(ctx, ".%c", "xyzw"[component + i]);
+         P(ctx, " >> %uu)", shift);
+      }
+      P(ctx, "));\n");
       return;
    }
 

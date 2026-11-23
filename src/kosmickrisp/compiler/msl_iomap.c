@@ -565,10 +565,20 @@ msl_nir_gather_io_info(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
    struct gather_ctx *ctx = (struct gather_ctx *)data;
 
-   /* Slots of the IO structs hold whole components */
-   assert(!(nir_intrinsic_has_io_semantics(intrin) &&
-            nir_intrinsic_io_semantics(intrin).high_16bits) &&
-          "16-bit halves of a component are not supported");
+   /* nir_opt_varyings may pack two 16-bit varyings into one component. The
+    * consumer then reads the whole component, but mesh output stores are
+    * scattered and stay split in halves. Mesh shaders write those halves into
+    * a 32-bit member, other stages only see whole components. */
+   if (nir_intrinsic_has_io_semantics(intrin) &&
+       nir_intrinsic_io_semantics(intrin).high_16bits) {
+      assert(b->shader->info.stage == MESA_SHADER_MESH &&
+             "16-bit halves of a component are not supported");
+      struct nir_io_semantics io = nir_intrinsic_io_semantics(intrin);
+      unsigned location =
+         nir_src_as_uint(*nir_get_io_offset_src(intrin)) + io.location;
+      ctx->output[location].packed16_mask |=
+         BITFIELD_BIT(nir_intrinsic_component(intrin));
+   }
 
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_interpolated_input: {
@@ -689,6 +699,13 @@ msl_gather_io_info(struct nir_to_msl_ctx *ctx,
    };
    nir_shader_intrinsics_pass(ctx->shader, msl_nir_gather_io_info,
                               nir_metadata_all, &gather_ctx);
+
+   /* Packed 16-bit halves are raw bits in a 32-bit member, like the consumer
+    * reads them */
+   for (unsigned i = 0; i < NUM_TOTAL_VARYING_SLOTS; i++) {
+      if (info_array_output[i].packed16_mask)
+         info_array_output[i].type = nir_type_uint32;
+   }
 }
 
 /* Generate all the struct definitions needed for shader I/O */

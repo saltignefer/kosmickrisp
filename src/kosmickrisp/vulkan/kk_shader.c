@@ -2243,9 +2243,19 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
                          UINT32_MAX, nir_opts, NULL, NULL);
    /* Second pass is required because some dEQP-VK.glsl.matrix.sub.dynamic.*
     * would fail otherwise due to vertex outputting vec4 while fragments reading
-    * vec3 when in reality only vec3 is needed. */
-   nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
-                         UINT32_MAX, nir_opts, NULL, NULL);
+    * vec3 when in reality only vec3 is needed.
+    *
+    * The first pass may pack two 16-bit varyings into one component, and
+    * merges the fragment shader loads of both halves, but scattered mesh
+    * output stores stay split. Another pass would then drop the high half
+    * stores, as no load of the high half is left. */
+   bool has_mesh = false;
+   for (uint32_t i = 0; i < total_shaders; i++)
+      has_mesh |= nir_shaders[i]->info.stage == MESA_SHADER_MESH;
+   if (!has_mesh) {
+      nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
+                            UINT32_MAX, nir_opts, NULL, NULL);
+   }
 
    for (uint32_t i = 0; i < total_shaders; i++) {
       struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;

@@ -16,6 +16,8 @@ struct io_slot_info {
    bool centroid;
    bool sample;
    bool uses_interpolant;
+   /* Components holding two 16-bit values, see mesh_packed16_access */
+   uint8_t packed16_mask;
 };
 
 struct nir_to_msl_ctx {
