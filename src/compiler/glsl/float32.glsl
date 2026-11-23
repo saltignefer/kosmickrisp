@@ -367,7 +367,7 @@ __fge32(uint a, uint b)
 }
 
 uint
-fsat32(uint a)
+__fsat32(uint a)
 {
    /* fsat(NaN) should be zero. */
    if (__is_nan(a) || int(a) < 0)
