@@ -1766,14 +1766,16 @@ gather_outputs(struct nir_builder *builder, nir_intrinsic_instr *intr, void *cb_
       }
 
       /* If the store value is inside a loop, there might be multiple
-       * different store values to the output. This matters for geometry
-       * shaders because they can each be for a different vertex.
+       * different store values to the output. This matters for geometry and
+       * mesh shaders because they can each be for a different vertex.
        *
        * TODO: This can disable uniform expression propagation and promotion
        * of convergent varyings to flat. We should use some kind of proper
        * loop invariance analysis to determine equility of output values.
        */
-      if (linkage->producer_stage == MESA_SHADER_GEOMETRY && !nir_scalar_is_const(value)) {
+      if ((linkage->producer_stage == MESA_SHADER_GEOMETRY ||
+           linkage->producer_stage == MESA_SHADER_MESH) &&
+          !nir_scalar_is_const(value)) {
          for (nir_cf_node *node = &nir_def_instr(value.def)->block->cf_node;
             node->type != nir_cf_node_function; node = node->parent) {
             if (node->type == nir_cf_node_loop) {
