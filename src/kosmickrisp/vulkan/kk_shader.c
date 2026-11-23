@@ -784,6 +784,11 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
       NIR_PASS(_, nir, nir_lower_vars_to_scratch, 0,
                glsl_get_natural_size_align_bytes,
                glsl_get_natural_size_align_bytes);
+   } else if (nir->info.stage == MESA_SHADER_MESH) {
+      /* The view index comes from the per-draw data, which the shader info
+       * must see */
+      NIR_PASS(_, nir, kk_nir_lower_mesh_multiview, state->mv->view_mask);
+      NIR_PASS(_, nir, kk_nir_lower_poly);
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, kk_nir_lower_fs_multiview, state->mv->view_mask);
 

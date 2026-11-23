@@ -259,11 +259,26 @@ kk_encoder_update_debug(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
       mtl_encoder_push_debug_group(encoder, label->pLabelName);
 }
 
+/* Vertex pipelines render one amplified copy per view of the render pass, the
+ * other pipelines draw once per view themselves. */
+void
+kk_cmd_set_view_amplification(struct kk_cmd_buffer *cmd, bool per_view)
+{
+   uint32_t view_mask = per_view ? cmd->state.gfx.render.view_mask : 0u;
+   uint32_t layer_ids[KK_MAX_MULTIVIEW_VIEW_COUNT] = {};
+   uint32_t count = 0u;
+   u_foreach_bit(id, view_mask)
+      layer_ids[count++] = id;
+   if (view_mask == 0u) {
+      layer_ids[count++] = 0;
+   }
+   mtl_set_vertex_amplification_count(cmd->metal.render, layer_ids, count);
+}
+
 void
 cs_start_render(struct kk_cmd_buffer *cmd)
 {
    struct kk_graphics_state *state = &cmd->state.gfx;
-   uint32_t view_mask = state->render.view_mask;
    assert(state->render_pass_descriptor);
 
    /* Ensure no other active encoder, aka compute */
@@ -279,14 +294,7 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    state->render.ds_write_available = false;
    state->render.storage_write_available = false;
 
-   uint32_t layer_ids[KK_MAX_MULTIVIEW_VIEW_COUNT] = {};
-   uint32_t count = 0u;
-   u_foreach_bit(id, view_mask)
-      layer_ids[count++] = id;
-   if (view_mask == 0u) {
-      layer_ids[count++] = 0;
-   }
-   mtl_set_vertex_amplification_count(cmd->metal.render, layer_ids, count);
+   kk_cmd_set_view_amplification(cmd, true);
 
    /* Argument table won't ever change */
    mtl_render_set_argument_table(

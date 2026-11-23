@@ -53,6 +53,12 @@ mtl_device_supports_sample_count(mtl_device *dev, uint32_t sample_count)
    return false;
 }
 
+uint32_t
+mtl_device_max_vertex_amplification_count(mtl_device *dev)
+{
+   return 1u;
+}
+
 struct mtl_size
 mtl_device_max_threads_per_threadgroup(mtl_device *dev)
 {

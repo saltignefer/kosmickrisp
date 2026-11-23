@@ -501,7 +501,7 @@ kk_get_device_features(
       /* VK_EXT_mesh_shader */
       .meshShader = supported_extensions->EXT_mesh_shader,
       .taskShader = supported_extensions->EXT_mesh_shader,
-      .multiviewMeshShader = false,
+      .multiviewMeshShader = supported_extensions->EXT_mesh_shader,
       .primitiveFragmentShadingRateMeshShader = false,
       .meshShaderQueries = false,
 
@@ -878,7 +878,9 @@ kk_get_device_properties(
        * memory. Metal drops draws, and mesh grids launched by object
        * functions, of 2^20 threadgroups or more. Some of these values are
        * below the Vulkan minimums, which is why mesh shaders are
-       * experimental. */
+       * experimental. Multiview draws once per view, see kk_draw_mesh, but
+       * render pass clears go through vertex amplification, which bounds the
+       * view count. */
       .maxTaskWorkGroupTotalCount = (1u << 20) - 1u,
       .maxTaskWorkGroupCount = {65535, 65535, 65535},
       .maxTaskWorkGroupInvocations = 128,
@@ -898,7 +900,8 @@ kk_get_device_properties(
       .maxMeshOutputVertices = 256,
       .maxMeshOutputPrimitives = 256,
       .maxMeshOutputLayers = 8,
-      .maxMeshMultiviewViewCount = 1,
+      .maxMeshMultiviewViewCount =
+         mtl_device_max_vertex_amplification_count(pdev->mtl_dev_handle),
       .meshOutputPerVertexGranularity = 1,
       .meshOutputPerPrimitiveGranularity = 1,
       .maxPreferredTaskWorkGroupInvocations = 32,

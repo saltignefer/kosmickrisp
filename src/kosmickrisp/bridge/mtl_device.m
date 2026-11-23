@@ -123,6 +123,18 @@ mtl_device_supports_sample_count(mtl_device *dev, uint32_t sample_count)
    }
 }
 
+uint32_t
+mtl_device_max_vertex_amplification_count(mtl_device *dev)
+{
+   @autoreleasepool {
+      id<MTLDevice> device = (id<MTLDevice>)dev;
+      uint32_t count = 1u;
+      while ([device supportsVertexAmplificationCount:count + 1u])
+         count++;
+      return count;
+   }
+}
+
 struct mtl_size
 mtl_device_max_threads_per_threadgroup(mtl_device *dev)
 {

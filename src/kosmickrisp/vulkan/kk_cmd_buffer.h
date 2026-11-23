@@ -93,6 +93,9 @@ struct kk_per_draw_data {
 
    /* Whether the last vertex of a primitive is its provoking vertex */
    uint32_t provoking_last;
+
+   /* View a mesh draw renders, see kk_draw_mesh */
+   uint32_t view_index;
 };
 
 struct kk_attachment {
@@ -313,6 +316,7 @@ kk_get_descriptors_state(struct kk_cmd_buffer *cmd,
 };
 
 void cs_start_render(struct kk_cmd_buffer *cmd);
+void kk_cmd_set_view_amplification(struct kk_cmd_buffer *cmd, bool per_view);
 mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
 mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd);
 void cs_end(struct kk_cmd_buffer *cmd);

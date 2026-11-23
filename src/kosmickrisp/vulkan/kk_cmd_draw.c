@@ -2783,28 +2783,41 @@ kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       task_threads = (struct mtl_size){1u, 1u, 1u};
    struct mtl_size mesh_threads = info->mesh.mesh_local_size;
 
+   /* Vertex amplification garbles per-primitive outputs, so draw every view
+    * of the render pass on its own. */
+   uint32_t view_mask = cmd->state.gfx.render.view_mask;
+   if (view_mask)
+      kk_cmd_set_view_amplification(cmd, false);
+
    mtl_render_encoder *enc = cs_get_render(cmd);
    for (uint32_t i = 0; i < data->draw_count; i++) {
-      if (upload_mask) {
-         struct kk_draw_data draw_data = {};
-         kk_upload_per_draw_data(cmd, upload_mask, i, &draw_data, false);
-      }
+      u_foreach_bit(view, view_mask ? view_mask : 1u) {
+         if (upload_mask) {
+            struct kk_draw_data draw_data = {};
+            per_draw->view_index = view;
+            kk_upload_per_draw_data(cmd, upload_mask, i, &draw_data, false);
+         }
 
-      if (data->indirect) {
-         uint64_t addr = data->indirect_command.addr +
-                         (uint64_t)i * data->indirect_command.stride;
-         mtl_draw_mesh_threadgroups_indirect(enc, addr, task_threads,
-                                             mesh_threads);
-      } else {
-         const VkDrawMeshTasksIndirectCommandEXT *draw = &data->mesh_draws[i];
-         struct mtl_size grid = {
-            .x = draw->groupCountX,
-            .y = draw->groupCountY,
-            .z = draw->groupCountZ,
-         };
-         mtl_draw_mesh_threadgroups(enc, grid, task_threads, mesh_threads);
+         if (data->indirect) {
+            uint64_t addr = data->indirect_command.addr +
+                            (uint64_t)i * data->indirect_command.stride;
+            mtl_draw_mesh_threadgroups_indirect(enc, addr, task_threads,
+                                                mesh_threads);
+         } else {
+            const VkDrawMeshTasksIndirectCommandEXT *draw =
+               &data->mesh_draws[i];
+            struct mtl_size grid = {
+               .x = draw->groupCountX,
+               .y = draw->groupCountY,
+               .z = draw->groupCountZ,
+            };
+            mtl_draw_mesh_threadgroups(enc, grid, task_threads, mesh_threads);
+         }
       }
    }
+
+   if (view_mask)
+      kk_cmd_set_view_amplification(cmd, true);
 }
 
 VKAPI_ATTR void VKAPI_CALL

@@ -105,6 +105,56 @@ kk_nir_lower_vs_multiview(nir_shader *nir, uint32_t view_mask)
    return progress;
 }
 
+/* Metal's vertex amplification garbles per-primitive user outputs of mesh
+ * shaders past the first view, so mesh pipelines draw once per view with the
+ * view index in the per-draw data. Primitives go to the layer of their view,
+ * which is also where the fragment shader reads its view index from. Every
+ * primitive the shader may output gets one, distributed among the
+ * invocations of the workgroup. */
+bool
+kk_nir_lower_mesh_multiview(nir_shader *nir, uint32_t view_mask)
+{
+   assert(nir->info.stage == MESA_SHADER_MESH);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (view_mask == 0u) {
+      nir_builder b = nir_builder_at(nir_before_impl(impl));
+      return nir_shader_intrinsics_pass(nir, replace_view_id_with_value,
+                                        nir_metadata_control_flow,
+                                        nir_imm_int(&b, 0u));
+   }
+
+   unsigned max_primitives = MAX2(nir->info.mesh.max_primitives_out, 1u);
+   unsigned threads = nir->info.workgroup_size[0] *
+                      nir->info.workgroup_size[1] * nir->info.workgroup_size[2];
+
+   nir_variable *layer = nir_variable_create(
+      nir, nir_var_shader_out,
+      glsl_array_type(glsl_uint_type(), max_primitives, 0), "kk_view_layer");
+   layer->data.location = VARYING_SLOT_LAYER;
+   layer->data.per_primitive = true;
+
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   nir_deref_instr *layer_deref = nir_build_deref_var(&b, layer);
+   nir_def *view_index = nir_load_view_index(&b);
+   nir_variable *index =
+      nir_local_variable_create(impl, glsl_uint_type(), "kk_view_primitive");
+   nir_store_var(&b, index, nir_load_local_invocation_index(&b), 0x1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, index);
+      nir_break_if(&b, nir_uge_imm(&b, i, max_primitives));
+      nir_store_deref(&b, nir_build_deref_array(&b, layer_deref, i), view_index,
+                      0x1);
+      nir_store_var(&b, index, nir_iadd_imm(&b, i, threads), 0x1);
+   }
+   nir_pop_loop(&b, loop);
+
+   nir->info.outputs_written |= VARYING_BIT_LAYER;
+   nir->info.per_primitive_outputs |= VARYING_BIT_LAYER;
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 bool
 kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask)
 {
