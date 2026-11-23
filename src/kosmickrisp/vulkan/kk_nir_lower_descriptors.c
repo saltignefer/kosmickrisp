@@ -418,6 +418,12 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    case nir_intrinsic_load_clip_z_coeff:
       return lower_sysval_to_root_table(b, intrin, draw.clip_z_coeff);
 
+   case nir_intrinsic_load_viewport_scale:
+      return lower_sysval_to_root_table(b, intrin, draw.viewport_scale);
+
+   case nir_intrinsic_load_viewport_offset:
+      return lower_sysval_to_root_table(b, intrin, draw.viewport_offset);
+
    case nir_intrinsic_load_is_depth_clamp_emulated_kk: {
       unsigned offset = kk_root_descriptor_offset(draw.emulate_depth_clamp);
       b->cursor = nir_instr_remove(&intrin->instr);

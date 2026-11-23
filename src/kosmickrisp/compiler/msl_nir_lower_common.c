@@ -899,18 +899,28 @@ find_mesh_position_store(nir_shader *s)
 }
 
 /* Mesh shaders write positions per vertex and component and may read them
- * back, so the depth transforms of the hardware vertex stage, see
- * nir_lower_clip_halfz_dynamic and msl_nir_lower_vs_disabled_depth_clamp_clip,
+ * back, so the position fixups of the hardware vertex stage, the depth
+ * transforms of nir_lower_clip_halfz_dynamic and
+ * msl_nir_lower_vs_disabled_depth_clamp_clip and the line tie nudge below,
  * apply once the workgroup is done with its vertices. Viewport indices are per
- * primitive, so the viewport Z transform uses the first viewport.
+ * primitive, so both use the first viewport.
  */
 bool
-msl_nir_lower_mesh_depth(nir_shader *s, bool clip_halfz, bool viewport_z)
+msl_nir_lower_mesh_position(nir_shader *s, bool clip_halfz, bool viewport_z)
 {
    assert(s->info.stage == MESA_SHADER_MESH);
 
+   /* Metal breaks diamond-exit ties its own way: a diamond owns its bottom
+    * corner, so a line that starts on the boundary between two pixel rows, at
+    * a column center, covers the row above, and one that ends there leaves
+    * that row out. Vulkan gives such a corner to neither diamond. Metal snaps
+    * positions to 1/256 of a pixel, so a vertex that lands on such a corner
+    * moves left by that much, the way Vulkan perturbs endpoints.
+    */
+   bool line_ties = s->info.mesh.primitive_type == MESA_PRIM_LINES;
+
    nir_intrinsic_instr *pos_store = find_mesh_position_store(s);
-   if (!(clip_halfz || viewport_z) || !pos_store)
+   if (!(clip_halfz || viewport_z || line_ties) || !pos_store)
       return false;
 
    nir_function_impl *impl = nir_shader_get_entrypoint(s);
@@ -957,6 +967,26 @@ msl_nir_lower_mesh_depth(nir_shader *s, bool clip_halfz, bool viewport_z)
             nir_fadd(b, nir_fmul(b, z, zscale), nir_fmul(b, w, zmin));
          nir_pop_if(b, NULL);
          z = nir_if_phi(b, transformed, z);
+      }
+
+      if (line_ties) {
+         nir_def *scale = nir_trim_vector(b, nir_load_viewport_scale(b), 2);
+         nir_def *offset = nir_trim_vector(b, nir_load_viewport_offset(b), 2);
+         nir_def *ndc = nir_fdiv(b, nir_trim_vector(b, pos, 2), w);
+         nir_def *window = nir_fadd(b, nir_fmul(b, ndc, scale), offset);
+         nir_def *subpixel = nir_iand_imm(
+            b, nir_f2i32(b, nir_fround_even(b, nir_fmul_imm(b, window, 256.0))),
+            0xff);
+         nir_def *tie =
+            nir_iand(b, nir_ieq_imm(b, nir_channel(b, subpixel, 0), 0x80),
+                     nir_ieq_imm(b, nir_channel(b, subpixel, 1), 0));
+         /* A zero scale means several viewports, see kk_flush_dynamic_state */
+         tie = nir_iand(b, tie, nir_fneu_imm(b, nir_channel(b, scale, 0), 0.0));
+         nir_def *step = nir_fdiv(b, nir_fmul_imm(b, w, 1.0 / 256.0),
+                                  nir_channel(b, scale, 0));
+         nir_def *x = nir_channel(b, pos, 0);
+         pos = nir_vector_insert_imm(
+            b, pos, nir_bcsel(b, tie, nir_fsub(b, x, step), x), 0);
       }
 
       nir_store_per_vertex_output(

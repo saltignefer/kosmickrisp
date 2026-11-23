@@ -41,6 +41,9 @@ struct kk_root_descriptor_table {
          float clip_z_coeff;
 
          float viewport_z_range[KK_MAX_VIEWPORTS * 2];
+         /* First viewport: window = ndc * scale + offset */
+         float viewport_scale[3];
+         float viewport_offset[3];
          bool emulate_depth_clamp;
          bool emulate_viewport_z;
       } draw;

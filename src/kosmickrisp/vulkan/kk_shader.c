@@ -430,7 +430,7 @@ static bool kk_is_possible_both_depth_clip_clamp(
    const struct vk_graphics_pipeline_state *state, bool enabled);
 
 /* Depth transforms of mesh positions the pipeline state may need, see
- * msl_nir_lower_mesh_depth. Part of the shader key. */
+ * msl_nir_lower_mesh_position. Part of the shader key. */
 struct kk_mesh_key {
    bool clip_halfz;
    bool viewport_z;
@@ -1631,10 +1631,10 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL);
    } else if (stage == MESA_SHADER_MESH) {
       /* After varying linking, which only allows output loads in the TCS.
-       * The system values the depth transforms read get lowered here. */
+       * The system values the position fixups read get lowered here. */
       struct kk_mesh_key key = kk_mesh_key(state);
       bool progress = false;
-      NIR_PASS(progress, nir, msl_nir_lower_mesh_depth, key.clip_halfz,
+      NIR_PASS(progress, nir, msl_nir_lower_mesh_position, key.clip_halfz,
                key.viewport_z);
       if (progress)
          NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL);

@@ -1411,6 +1411,20 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
         IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE)))
       kk_flush_vp_state(cmd);
 
+   /* Mesh line ties are measured for one viewport. Mesh shaders pick the
+    * viewport per primitive, so with several leave the lines alone, which a
+    * zero scale tells msl_nir_lower_mesh_position. */
+   if ((IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS)) &&
+       dyn->vp.viewport_count > 0) {
+      const VkViewport *vp = &dyn->vp.viewports[0];
+      desc->root.draw.viewport_scale[0] =
+         dyn->vp.viewport_count == 1 ? vp->width * 0.5f : 0.0f;
+      desc->root.draw.viewport_scale[1] = vp->height * 0.5f;
+      desc->root.draw.viewport_offset[0] = vp->x + vp->width * 0.5f;
+      desc->root.draw.viewport_offset[1] = vp->y + vp->height * 0.5f;
+      desc->root_dirty = true;
+   }
+
    if (IS_DIRTY(VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
       desc->root.draw.clip_z_coeff =
          dyn->vp.depth_clip_negative_one_to_one ? 0.5f : 0.0f;
