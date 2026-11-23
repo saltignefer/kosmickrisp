@@ -874,6 +874,95 @@ msl_nir_lower_vs_disabled_depth_clamp_clip(nir_shader *s)
    return nir_progress(true, b->impl, nir_metadata_none);
 }
 
+static nir_intrinsic_instr *
+find_mesh_position_store(nir_shader *s)
+{
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_store_per_vertex_output &&
+             nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_POS)
+            return intr;
+      }
+   }
+   return NULL;
+}
+
+/* Mesh shaders write positions per vertex and component and may read them
+ * back, so the depth transforms of the hardware vertex stage, see
+ * nir_lower_clip_halfz_dynamic and msl_nir_lower_vs_disabled_depth_clamp_clip,
+ * apply once the workgroup is done with its vertices. Viewport indices are per
+ * primitive, so the viewport Z transform uses the first viewport.
+ */
+bool
+msl_nir_lower_mesh_depth(nir_shader *s, bool clip_halfz, bool viewport_z)
+{
+   assert(s->info.stage == MESA_SHADER_MESH);
+
+   nir_intrinsic_instr *pos_store = find_mesh_position_store(s);
+   if (!(clip_halfz || viewport_z) || !pos_store)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   nir_builder b_ = nir_builder_at(nir_after_impl(impl));
+   nir_builder *b = &b_;
+   unsigned max_vertices = MAX2(s->info.mesh.max_vertices_out, 1u);
+   unsigned threads = s->info.workgroup_size[0] * s->info.workgroup_size[1] *
+                      s->info.workgroup_size[2];
+
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_shader_out);
+
+   /* Every vertex the shader may output, distributed among the invocations */
+   nir_variable *index =
+      nir_local_variable_create(impl, glsl_uint_type(), "depth_vertex");
+   nir_store_var(b, index, nir_load_local_invocation_index(b), 0x1);
+   nir_loop *loop = nir_push_loop(b);
+   {
+      nir_def *vertex = nir_load_var(b, index);
+      nir_break_if(b, nir_uge_imm(b, vertex, max_vertices));
+
+      nir_io_semantics sem = nir_intrinsic_io_semantics(pos_store);
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_def *pos = nir_load_per_vertex_output(
+         b, 4, 32, vertex, zero, .base = nir_intrinsic_base(pos_store),
+         .component = 0, .dest_type = nir_type_float32, .io_semantics = sem);
+      nir_def *z = nir_channel(b, pos, 2);
+      nir_def *w = nir_channel(b, pos, 3);
+
+      if (clip_halfz) {
+         nir_def *c = nir_load_clip_z_coeff(b);
+         z = nir_ffma_weak(b, nir_fneg(b, z), c, nir_ffma_weak(b, w, c, z));
+      }
+
+      if (viewport_z) {
+         nir_def *emulated = nir_load_is_viewport_z_transform_emulated_kk(b);
+         nir_push_if(b, emulated);
+         nir_def *zrange = nir_load_viewport_z_range_kk(b, 2, 32, zero);
+         nir_def *zmin = nir_channel(b, zrange, 0);
+         nir_def *zscale = nir_fsub(b, nir_channel(b, zrange, 1), zmin);
+         nir_def *transformed =
+            nir_fadd(b, nir_fmul(b, z, zscale), nir_fmul(b, w, zmin));
+         nir_pop_if(b, NULL);
+         z = nir_if_phi(b, transformed, z);
+      }
+
+      nir_store_per_vertex_output(
+         b, nir_vector_insert_imm(b, pos, z, 2), vertex, zero,
+         .base = nir_intrinsic_base(pos_store), .write_mask = 0xf,
+         .component = 0, .src_type = nir_type_float32, .io_semantics = sem);
+      nir_store_var(b, index, nir_iadd_imm(b, vertex, threads), 0x1);
+   }
+   nir_pop_loop(b, loop);
+
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 static void
 collect_depth_clamp_data(nir_shader *s, nir_intrinsic_instr **depth_store)
 {

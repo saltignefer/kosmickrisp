@@ -190,6 +190,28 @@ kk_make_feature_key(const struct vk_features *feats,
    return key;
 }
 
+static bool kk_is_possible_both_depth_clip_clamp(
+   const struct vk_graphics_pipeline_state *state, bool enabled);
+
+/* Depth transforms of mesh positions the pipeline state may need, see
+ * msl_nir_lower_mesh_depth. Part of the shader key. */
+struct kk_mesh_key {
+   bool clip_halfz;
+   bool viewport_z;
+};
+
+static struct kk_mesh_key
+kk_mesh_key(const struct vk_graphics_pipeline_state *state)
+{
+   return (struct kk_mesh_key){
+      .clip_halfz =
+         BITSET_TEST(state->dynamic,
+                     MESA_VK_DYNAMIC_VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE) ||
+         (state->vp && state->vp->depth_clip_negative_one_to_one),
+      .viewport_z = kk_is_possible_both_depth_clip_clamp(state, false),
+   };
+}
+
 static void
 kk_hash_graphics_state(struct vk_physical_device *device,
                        const struct vk_graphics_pipeline_state *state,
@@ -205,6 +227,11 @@ kk_hash_graphics_state(struct vk_physical_device *device,
    if (stages & VK_SHADER_STAGE_VERTEX_BIT) {
       struct kk_vs_key key;
       kk_populate_vs_key(&key, state);
+      _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
+   }
+
+   if (stages & VK_SHADER_STAGE_MESH_BIT_EXT) {
+      struct kk_mesh_key key = kk_mesh_key(state);
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
    }
 
@@ -480,7 +507,6 @@ kk_lower_hw_mesh(nir_shader *nir)
       nir_shader_intrinsics_pass(nir, msl_nir_vs_remove_point_size_write,
                                  nir_metadata_control_flow, NULL);
 
-   /* TODO_KOSMICKRISP: depth clip/clamp emulation for mesh outputs. */
    NIR_PASS(_, nir, msl_nir_vs_io_types);
 }
 
@@ -1357,6 +1383,15 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       /* Descriptors were lowered with the GS, this lowers the system values
        * the hardware vertex lowering added */
       NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL);
+   } else if (stage == MESA_SHADER_MESH) {
+      /* After varying linking, which only allows output loads in the TCS.
+       * The system values the depth transforms read get lowered here. */
+      struct kk_mesh_key key = kk_mesh_key(state);
+      bool progress = false;
+      NIR_PASS(progress, nir, msl_nir_lower_mesh_depth, key.clip_halfz,
+               key.viewport_z);
+      if (progress)
+         NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL);
    }
 
    /* KK_WORKAROUND_19 Only the stage that feeds geometry will be dispatched
