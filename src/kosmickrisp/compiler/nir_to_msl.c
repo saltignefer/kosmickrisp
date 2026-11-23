@@ -962,6 +962,15 @@ atomic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
    P(ctx, ");\n");
 }
 
+/* Lets helper invocations out of compare and exchange retry loops */
+static const char *
+cas_helper_exit(struct nir_to_msl_ctx *ctx)
+{
+   return ctx->shader->info.stage == MESA_SHADER_FRAGMENT
+             ? "!simd_is_helper_thread() && "
+             : "";
+}
+
 static void
 atomic_swap_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
                    const char *scope, bool shared)
@@ -970,9 +979,15 @@ atomic_swap_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
    const char *mem_order = "memory_order_relaxed";
    const char *type = msl_type_for_def(ctx->types, &instr->def);
 
+   /* The weak exchange may fail spuriously, leaving the expected value as
+    * is. Retry until it succeeds or reads another value. On unmapped pages of
+    * sparse buffers it succeeds. Helper invocations do not write memory, so
+    * they do not retry. */
+   assert(instr->def.bit_size == 32);
    P_IND(ctx, "%s ta%d = ", type, instr->def.index);
    src_to_msl(ctx, &instr->src[1]);
-   P(ctx, "; %s_explicit((%s atomic_%s*)", atomic_op, scope, type);
+   P(ctx, "; while (%s!%s_explicit((%s atomic_%s*)", cas_helper_exit(ctx),
+     atomic_op, scope, type);
    if (shared)
       P(ctx, "&shared_data[%u + ", nir_intrinsic_base(instr));
    src_to_msl(ctx, &instr->src[0]);
@@ -981,7 +996,10 @@ atomic_swap_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
    P(ctx, ", ");
    P(ctx, "&ta%d, ", instr->def.index);
    src_to_msl(ctx, &instr->src[2]);
-   P(ctx, ", %s, %s);", mem_order, mem_order);
+   P(ctx, ", %s, %s) && as_type<uint>(ta%d) == as_type<uint>(", mem_order,
+     mem_order, instr->def.index);
+   src_to_msl(ctx, &instr->src[1]);
+   P(ctx, ")) {}");
    P(ctx, "%s t%d = ta%d;\n", type, instr->def.index, instr->def.index);
 }
 
@@ -1952,16 +1970,21 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P(ctx, ").x;\n");
       break;
    case nir_intrinsic_bindless_image_atomic_swap: {
+      /* Retries spurious failures, see atomic_swap_to_msl */
       const char *type = msl_type_for_def(ctx->types, &instr->def);
+      assert(instr->def.bit_size == 32);
       P_IND(ctx, "%s4 ta%d = ", type, instr->def.index);
       src_to_msl(ctx, &instr->src[3]);
-      P(ctx, "; ");
+      P(ctx, "; while (%s!", cas_helper_exit(ctx));
       src_to_msl(ctx, &instr->src[0]);
       P(ctx, ".%s(", atomic_op_to_msl(nir_intrinsic_atomic_op(instr)));
       image_coord_swizzle(ctx, instr);
       P(ctx, ", &ta%d, ", instr->def.index);
       src_to_msl(ctx, &instr->src[4]);
-      P(ctx, "); %s t%d = ta%d.x;\n", type, instr->def.index, instr->def.index);
+      P(ctx, ") && as_type<uint>(ta%d.x) == as_type<uint>(", instr->def.index);
+      src_to_msl(ctx, &instr->src[3]);
+      P(ctx, ")) {}");
+      P(ctx, " %s t%d = ta%d.x;\n", type, instr->def.index, instr->def.index);
       break;
    }
    case nir_intrinsic_bindless_image_fence_kk: {
