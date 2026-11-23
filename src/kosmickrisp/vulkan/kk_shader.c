@@ -67,6 +67,231 @@ kk_get_spirv_options(struct vk_physical_device *vk_pdev,
    };
 }
 
+#include "float32_spv.h"
+
+static const nir_shader *
+kk_get_softfp32(struct kk_physical_device *pdev)
+{
+   simple_mtx_lock(&pdev->softfloat_lock);
+   if (!pdev->softfp32) {
+      const struct spirv_capabilities caps = {
+         .Shader = true,
+      };
+      const struct spirv_to_nir_options options = {
+         .capabilities = &caps,
+         .environment = NIR_SPIRV_VULKAN,
+         .create_library = true,
+      };
+      nir_shader *lib = spirv_to_nir(
+         float32_spv_source, ARRAY_SIZE(float32_spv_source), NULL,
+         MESA_SHADER_COMPUTE, "main", &options, &kk_nir_options);
+      NIR_PASS(_, lib, nir_lower_variable_initializers, nir_var_function_temp);
+      NIR_PASS(_, lib, nir_lower_returns);
+      NIR_PASS(_, lib, nir_inline_functions);
+      nir_remove_non_exported(lib);
+      NIR_PASS(_, lib, nir_lower_vars_to_ssa);
+      NIR_PASS(_, lib, nir_opt_copy_prop);
+      NIR_PASS(_, lib, nir_opt_dce);
+      nir_sweep(lib);
+      pdev->softfp32 = lib;
+   }
+   simple_mtx_unlock(&pdev->softfloat_lock);
+   return pdev->softfp32;
+}
+
+/* Fused fp32 fma from exact fp64 math: the product of two fp32 values is
+ * exact in fp64, and TwoSum gives the error of the fp64 sum. Rounding that
+ * sum to odd keeps enough information for the final rounding to fp32 to be
+ * correct. */
+static nir_def *
+kk_fused_fma32(nir_builder *b, nir_def *x, nir_def *y, nir_def *z)
+{
+   uint32_t fp_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl = nir_fp_no_fast_math;
+
+   nir_def *s = nir_fmul(b, nir_f2f64(b, x), nir_f2f64(b, y));
+   nir_def *c = nir_f2f64(b, z);
+   nir_def *t = nir_fadd(b, s, c);
+   nir_def *bp = nir_fadd(b, t, nir_fneg(b, s));
+   nir_def *ap = nir_fadd(b, t, nir_fneg(b, bp));
+   nir_def *e = nir_fadd(b, nir_fadd(b, s, nir_fneg(b, ap)),
+                         nir_fadd(b, c, nir_fneg(b, bp)));
+
+   /* An inexact t with an even mantissa moves one ulp towards the exact sum.
+    * Inexact means t is finite and not zero. */
+   nir_def *inexact = nir_iand(b, nir_fneu_imm(b, e, 0.0), nir_fisfinite(b, t));
+   nir_def *even = nir_ieq_imm(b, nir_iand_imm(b, t, 1), 0);
+   nir_def *towards_inf = nir_ieq(b, nir_flt_imm(b, e, 0.0),
+                                  nir_flt_imm(b, t, 0.0));
+   nir_def *odd = nir_iadd(b, t, nir_bcsel(b, towards_inf, nir_imm_int64(b, 1),
+                                           nir_imm_int64(b, -1)));
+   nir_def *sum = nir_bcsel(b, nir_iand(b, inexact, even), odd, t);
+   nir_def *res = nir_f2f32(b, sum);
+
+   b->fp_math_ctrl = fp_math_ctrl;
+   return res;
+}
+
+/* Prepare fp32 ALU for the software float library, which has no fsub, no
+ * dot products and only an unfused fmad. Fused fma goes through fp64. */
+static bool
+kk_prepare_softfp32(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->def.bit_size != 32)
+      return false;
+
+   switch (alu->op) {
+   case nir_op_fsub:
+   case nir_op_ffma:
+   case nir_op_ffma_weak:
+   case nir_op_fdot2:
+   case nir_op_fdot3:
+   case nir_op_fdot4:
+      break;
+   default:
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *src0 = nir_ssa_for_alu_src(b, alu, 0);
+
+   switch (alu->op) {
+   case nir_op_fsub:
+      nir_def_replace(&alu->def,
+                      nir_fadd(b, src0,
+                               nir_fneg(b, nir_ssa_for_alu_src(b, alu, 1))));
+      return true;
+   case nir_op_ffma:
+      nir_def_replace(&alu->def,
+                      kk_fused_fma32(b, src0, nir_ssa_for_alu_src(b, alu, 1),
+                                     nir_ssa_for_alu_src(b, alu, 2)));
+      return true;
+   case nir_op_ffma_weak:
+      nir_def_replace(&alu->def,
+                      nir_fmad(b, src0, nir_ssa_for_alu_src(b, alu, 1),
+                               nir_ssa_for_alu_src(b, alu, 2)));
+      return true;
+   case nir_op_fdot2:
+   case nir_op_fdot3:
+   case nir_op_fdot4: {
+      nir_def *src1 = nir_ssa_for_alu_src(b, alu, 1);
+      nir_def *sum = NULL;
+      for (unsigned i = 0; i < src0->num_components; i++) {
+         nir_def *prod =
+            nir_fmul(b, nir_channel(b, src0, i), nir_channel(b, src1, i));
+         sum = sum ? nir_fadd(b, sum, prod) : prod;
+      }
+      nir_def_replace(&alu->def, sum);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* Metal derivatives and float atomic adds flush fp32 denormals too. Build
+ * derivatives from quad swaps and atomic adds from compare and swap loops,
+ * so their arithmetic goes through the float32 library. Coarse derivatives
+ * may be fine ones. */
+static bool
+kk_prepare_softfp32_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+                           UNUSED void *data)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddx_coarse:
+   case nir_intrinsic_ddx_fine:
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddy_coarse:
+   case nir_intrinsic_ddy_fine: {
+      if (intr->def.bit_size != 32)
+         return false;
+
+      bool y = intr->intrinsic == nir_intrinsic_ddy ||
+               intr->intrinsic == nir_intrinsic_ddy_coarse ||
+               intr->intrinsic == nir_intrinsic_ddy_fine;
+      nir_def *v = intr->src[0].ssa;
+      nir_def *other = y ? nir_quad_swap_vertical(b, v)
+                         : nir_quad_swap_horizontal(b, v);
+      /* Quad lanes are (0, 0), (1, 0), (0, 1), (1, 1). Both lanes of a pair
+       * subtract the same operands, so they get the same zero sign. */
+      nir_def *second = nir_i2b(
+         b, nir_iand_imm(b, nir_load_subgroup_invocation(b), y ? 2 : 1));
+      nir_def *hi = nir_bcsel(b, second, v, other);
+      nir_def *lo = nir_bcsel(b, second, other, v);
+      nir_def_replace(&intr->def, nir_fadd(b, hi, nir_fneg(b, lo)));
+      return true;
+   }
+
+   case nir_intrinsic_deref_atomic: {
+      /* poly_nir_lower_gs runs geometry shaders in several variants that
+       * strip the side effects they do not need, which loses the results of
+       * a compare and swap loop. Geometry shaders keep the native add. */
+      if (nir_intrinsic_atomic_op(intr) != nir_atomic_op_fadd ||
+          intr->def.bit_size != 32 || intr->def.num_components != 1 ||
+          b->shader->info.stage == MESA_SHADER_GEOMETRY)
+         return false;
+
+      nir_def *deref = intr->src[0].ssa;
+      nir_def *value = intr->src[1].ssa;
+      enum gl_access_qualifier access = nir_intrinsic_access(intr);
+
+      /* Guess 0 instead of loading the value, which would race with the
+       * atomics of other invocations. A wrong guess fails the first swap,
+       * which returns the value. */
+      nir_variable *old_var =
+         nir_local_variable_create(b->impl, glsl_uint_type(), "kk_fadd_old");
+      nir_store_var(b, old_var, nir_imm_int(b, 0), 0x1);
+      nir_push_loop(b);
+      {
+         /* Helper invocations do not write memory, so they leave */
+         if (b->shader->info.stage == MESA_SHADER_FRAGMENT)
+            nir_break_if(b, nir_is_helper_invocation(b, 1));
+
+         nir_def *old = nir_load_var(b, old_var);
+         nir_def *sum = nir_fadd(b, old, value);
+         nir_def *prev = nir_deref_atomic_swap(
+            b, 32, deref, old, sum, .atomic_op = nir_atomic_op_cmpxchg,
+            .access = access);
+         nir_store_var(b, old_var, prev, 0x1);
+         nir_break_if(b, nir_ieq(b, prev, old));
+      }
+      nir_pop_loop(b, NULL);
+      nir_def_replace(&intr->def, nir_load_var(b, old_var));
+      return true;
+   }
+
+   default:
+      return false;
+   }
+}
+
+/* Metal flushes fp32 denormals in arithmetic in every math mode. Shaders
+ * asking for DenormPreserve get the basic ops from the float32 library,
+ * which works on the bits as integers. That covers the instructions Vulkan
+ * requires to respect DenormPreserve (see "Denormalized values" in the
+ * spec): add, mul, fma, conversions, comparisons, min, max, sign ops,
+ * derivatives and float atomics, except in geometry shaders. Subgroup min,
+ * max and equality votes are lowered to ALU before. Others, such as division
+ * and sqrt, may flush and stay in Metal. */
+static void
+kk_lower_fp32_denorm_preserve(struct kk_physical_device *pdev,
+                              nir_shader *nir)
+{
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, kk_prepare_softfp32_intrin,
+            nir_metadata_none, NULL);
+   NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+   NIR_PASS(_, nir, nir_lower_flrp, 32, false);
+   NIR_PASS(_, nir, nir_shader_alu_pass, kk_prepare_softfp32,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_lower_floats, kk_get_softfp32(pdev));
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_dce);
+}
+
 static void
 kk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
                   UNUSED const struct vk_pipeline_robustness_state *rs)
@@ -86,6 +311,14 @@ kk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
       .has_base_workgroup_id = nir->info.stage == MESA_SHADER_COMPUTE,
    };
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv_options);
+
+   struct kk_physical_device *pdev =
+      container_of(vk_pdev, struct kk_physical_device, vk);
+   unsigned fc_mode = nir->info.float_controls_execution_mode;
+
+   /* msl_optimize_nir handles DenormFlushToZero */
+   if (nir_is_denorm_preserve(fc_mode, 32))
+      kk_lower_fp32_denorm_preserve(pdev, nir);
 
 }
 

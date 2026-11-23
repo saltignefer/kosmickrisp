@@ -1096,6 +1096,18 @@ msl_nir_lower_multisample_alpha(nir_shader *s, bool alpha_to_coverage,
    return progress;
 }
 
+/* Flushes a denormal to a zero of the same sign */
+nir_def *
+msl_nir_flush_denorm(nir_builder *b, nir_def *x)
+{
+   unsigned bits = x->bit_size;
+   assert(bits == 32 || bits == 64);
+   uint64_t sign = BITFIELD64_BIT(bits - 1);
+   uint64_t exp = bits == 64 ? 0x7ff0000000000000ull : 0x7f800000u;
+   nir_def *is_denorm = nir_ieq_imm(b, nir_iand_imm(b, x, exp), 0);
+   return nir_bcsel(b, is_denorm, nir_iand_imm(b, x, sign), x);
+}
+
 static bool
 is_fp64_alu(const nir_alu_instr *alu)
 {
@@ -1191,6 +1203,135 @@ widen_fp64_conversion(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
    return true;
 }
 
+/* The float64 library preserves denormals. Under DenormFlushToZero, flush
+ * the float operands and results of fp64 ALU instead. */
+static bool
+flush_fp64_alu(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (!is_fp64_alu(alu))
+      return false;
+
+   const nir_op_info *info = &nir_op_infos[alu->op];
+   b->cursor = nir_before_instr(&alu->instr);
+   for (unsigned i = 0; i < info->num_inputs; i++) {
+      if (nir_alu_type_get_base_type(info->input_types[i]) != nir_type_float ||
+          nir_src_bit_size(alu->src[i].src) != 64)
+         continue;
+
+      nir_def *src = msl_nir_flush_denorm(b, nir_ssa_for_alu_src(b, alu, i));
+      nir_src_rewrite(&alu->src[i].src, src);
+      for (unsigned c = 0; c < NIR_MAX_VEC_COMPONENTS; c++)
+         alu->src[i].swizzle[c] = c;
+   }
+
+   if (nir_alu_type_get_base_type(info->output_type) == nir_type_float &&
+       alu->def.bit_size == 64) {
+      b->cursor = nir_after_instr(&alu->instr);
+      nir_def *flushed = msl_nir_flush_denorm(b, &alu->def);
+      nir_def_rewrite_uses_after(&alu->def, flushed);
+   }
+
+   return true;
+}
+
+/* The float64 library rounds fp64 to fp32 with denormals. Under fp32
+ * DenormFlushToZero, flush the result. */
+static bool
+flush_fp64_to_fp32(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_f2f32 || nir_src_bit_size(alu->src[0].src) != 64)
+      return false;
+
+   b->cursor = nir_after_instr(&alu->instr);
+   nir_def *flushed = msl_nir_flush_denorm(b, &alu->def);
+   nir_def_rewrite_uses_after(&alu->def, flushed);
+   return true;
+}
+
+/* Whether a fp32 value is never denormal: results of arithmetic Metal
+ * flushes, conversions from integers and fp16, and normal constants */
+static bool
+fp32_never_denormal(nir_scalar s)
+{
+   if (nir_scalar_is_const(s)) {
+      uint32_t bits = nir_scalar_as_uint(s);
+      return (bits & 0x7f800000u) != 0u || (bits & 0x7fffffffu) == 0u;
+   }
+
+   if (!nir_scalar_is_alu(s))
+      return false;
+
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_fadd:
+   case nir_op_fsub:
+   case nir_op_fmul:
+   case nir_op_ffma:
+   case nir_op_fdiv:
+   case nir_op_frcp:
+   case nir_op_fsqrt:
+   case nir_op_frsq:
+   case nir_op_i2f32:
+   case nir_op_u2f32:
+      return true;
+   case nir_op_f2f32:
+      return nir_src_bit_size(nir_def_as_alu(s.def)->src[0].src) == 16;
+   default:
+      return false;
+   }
+}
+
+/* Metal flushes fp32 denormals in arithmetic, but not in ops that only touch
+ * the sign, in min, max and saturate with a normal operand, nor in sin,
+ * which returns tiny arguments as is. Sources that are never denormal need
+ * no flush, except for sin. */
+static bool
+flush_fp32_sign_ops(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->def.bit_size != 32)
+      return false;
+
+   switch (alu->op) {
+   case nir_op_fneg:
+   case nir_op_fabs:
+   case nir_op_fmin:
+   case nir_op_fmax:
+   case nir_op_fsat: {
+      bool never_denormal = true;
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+         for (unsigned c = 0; c < alu->def.num_components; c++) {
+            never_denormal &= fp32_never_denormal(
+               nir_get_scalar(alu->src[i].src.ssa, alu->src[i].swizzle[c]));
+         }
+      }
+      if (never_denormal)
+         return false;
+      break;
+   }
+   case nir_op_fsin:
+      break;
+   default:
+      return false;
+   }
+
+   b->cursor = nir_after_instr(&alu->instr);
+   nir_def *flushed = msl_nir_flush_denorm(b, &alu->def);
+   nir_def_rewrite_uses_after(&alu->def, flushed);
+   return true;
+}
+
+/* Flushes the results of fp32 ops Metal leaves denormal under
+ * DenormFlushToZero. Runs once, after all passes that may create such ops. */
+bool
+msl_nir_flush_fp32_denorms(nir_shader *nir)
+{
+   if (!nir_is_denorm_flush_to_zero(nir->info.float_controls_execution_mode,
+                                    32))
+      return false;
+
+   return nir_shader_alu_pass(nir, flush_fp32_sign_ops,
+                              nir_metadata_control_flow, NULL);
+}
+
 /* Metal has no double type. nir_to_msl prints fp64 ALU as calls into the
  * float64 library, see msl_float64_gen.py. Lower what the library has no
  * function for to ops it has. Runs after the optimization loop, which may
@@ -1219,6 +1360,16 @@ msl_nir_lower_fp64(nir_shader *nir)
    NIR_PASS(progress, nir, nir_lower_doubles, NULL,
             nir_lower_drcp | nir_lower_drsq | nir_lower_dceil |
                nir_lower_dmod | nir_lower_dsub | nir_lower_ddiv);
+   if (nir_is_denorm_flush_to_zero(nir->info.float_controls_execution_mode,
+                                   64)) {
+      NIR_PASS(progress, nir, nir_shader_alu_pass, flush_fp64_alu,
+               nir_metadata_control_flow, NULL);
+   }
+   if (nir_is_denorm_flush_to_zero(nir->info.float_controls_execution_mode,
+                                   32)) {
+      NIR_PASS(progress, nir, nir_shader_alu_pass, flush_fp64_to_fp32,
+               nir_metadata_control_flow, NULL);
+   }
    return progress;
 }
 

@@ -109,8 +109,10 @@ bool msl_nir_lower_multisample_alpha(nir_shader *s, bool alpha_to_coverage,
 
 bool msl_gather_uses_per_draw_data(nir_shader *nir);
 
+nir_def *msl_nir_flush_denorm(struct nir_builder *b, nir_def *x);
 bool msl_nir_alu_is_fp64(const nir_alu_instr *alu);
 bool msl_nir_lower_fp64(nir_shader *nir);
+bool msl_nir_flush_fp32_denorms(nir_shader *nir);
 
 
 static const nir_shader_compiler_options kk_nir_options = {

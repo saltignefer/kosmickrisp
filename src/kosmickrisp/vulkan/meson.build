@@ -129,6 +129,21 @@ kk_drirc = custom_target(
   ],
 )
 
+kk_float32_spv_h = custom_target(
+  'float32_spv.h',
+  input : [glsl2spirv, float32_glsl_file],
+  output : 'float32_spv.h',
+  command : [
+    prog_python, '@INPUT@', '@OUTPUT@',
+    prog_glslang,
+    '--vn', 'float32_spv_source',
+    '--glsl-version', '450',
+    '-Olib',
+    glslang_depfile,
+  ],
+  depfile : 'float32_spv.h.d',
+)
+
 kk_entrypoints = custom_target(
   'kk_entrypoints',
   input : [vk_entrypoints_gen, vk_api_xml],
@@ -164,6 +179,7 @@ libkk = static_library(
     kk_files,
     kk_entrypoints,
     kk_drirc,
+    kk_float32_spv_h,
     sha1_h,
   ],
   include_directories : [

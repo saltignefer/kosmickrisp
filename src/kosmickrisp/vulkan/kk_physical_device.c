@@ -733,24 +733,28 @@ kk_get_device_properties(
       .independentResolve = true,
       .driverID = VK_DRIVER_ID_MESA_KOSMICKRISP,
       .conformanceVersion = (VkConformanceVersion){1, 4, 6, 2},
-      .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
-      .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
+      /* Each width is handled on its own: fp16 denormals are native, fp32
+       * ones flush in hardware and are preserved with the software float32
+       * library, and fp64 is all software. */
+      .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
+      .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .shaderSignedZeroInfNanPreserveFloat16 = true,
       .shaderSignedZeroInfNanPreserveFloat32 = true,
-      /* The software fp64 library is IEEE 754 with round to nearest even */
+      /* The software fp64 library is IEEE 754, built for the rounding mode of
+       * each shader */
       .shaderSignedZeroInfNanPreserveFloat64 = pdev->info.gpu_apple_family >= 9,
-      .shaderDenormPreserveFloat16 = false,
-      .shaderDenormPreserveFloat32 = false,
-      .shaderDenormPreserveFloat64 = false,
+      .shaderDenormPreserveFloat16 = true,
+      .shaderDenormPreserveFloat32 = true,
+      .shaderDenormPreserveFloat64 = pdev->info.gpu_apple_family >= 9,
       .shaderDenormFlushToZeroFloat16 = false,
-      .shaderDenormFlushToZeroFloat32 = false,
-      .shaderDenormFlushToZeroFloat64 = false,
+      .shaderDenormFlushToZeroFloat32 = true,
+      .shaderDenormFlushToZeroFloat64 = pdev->info.gpu_apple_family >= 9,
       .shaderRoundingModeRTEFloat16 = true,
       .shaderRoundingModeRTEFloat32 = true,
       .shaderRoundingModeRTEFloat64 = pdev->info.gpu_apple_family >= 9,
       .shaderRoundingModeRTZFloat16 = false,
       .shaderRoundingModeRTZFloat32 = false,
-      .shaderRoundingModeRTZFloat64 = false,
+      .shaderRoundingModeRTZFloat64 = pdev->info.gpu_apple_family >= 9,
       .maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX,
       .shaderUniformBufferArrayNonUniformIndexingNative = true,
       .shaderSampledImageArrayNonUniformIndexingNative = true,
@@ -1319,6 +1323,8 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    if (result != VK_SUCCESS)
       goto fail_disk_cache;
 
+   simple_mtx_init(&pdev->softfloat_lock, mtx_plain);
+
    list_add(&pdev->vk.link, &instance->vk.physical_devices.list);
 
    return VK_SUCCESS;
@@ -1339,6 +1345,8 @@ kk_physical_device_destroy(struct vk_physical_device *vk_pdev)
       container_of(vk_pdev, struct kk_physical_device, vk);
 
    kk_finish_wsi(pdev);
+   ralloc_free(pdev->softfp32);
+   simple_mtx_destroy(&pdev->softfloat_lock);
    kk_physical_device_free_disk_cache(pdev);
    vk_physical_device_finish(&pdev->vk);
    mtl_release(pdev->mtl_dev_handle);

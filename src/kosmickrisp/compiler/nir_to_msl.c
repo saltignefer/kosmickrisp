@@ -2862,6 +2862,7 @@ msl_optimize_nir(struct nir_shader *nir)
    NIR_PASS(_, nir, nir_opt_shrink_stores, false);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, msl_nir_lower_algebraic_late);
+   NIR_PASS(_, nir, msl_nir_flush_fp32_denorms);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    NIR_PASS(_, nir, nir_trivialize_registers);
    NIR_PASS(_, nir, nir_opt_copy_prop);

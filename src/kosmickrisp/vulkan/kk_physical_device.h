@@ -85,6 +85,9 @@ struct kk_physical_device {
    struct kk_queue_family queue_families[3];
    uint8_t queue_family_count;
 
+   /* Software float32 library for DenormPreserve, built on first use */
+   simple_mtx_t softfloat_lock;
+   struct nir_shader *softfp32;
 };
 
 static inline uint32_t

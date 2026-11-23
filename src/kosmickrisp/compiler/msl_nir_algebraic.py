@@ -32,6 +32,14 @@ lower += [
    ('ior', ('u2u64', a), ('ishl', ('u2u64', b), 32))),
 ]
 
+# nir_opt_algebraic keeps fcanonicalize under DenormFlushToZero. Metal has no
+# such function, so flush denormals to a zero of the same sign by hand.
+for bits, exp in [(16, 0x7c00), (32, 0x7f800000), (64, 0x7ff0000000000000)]:
+  sign = 1 << (bits - 1)
+  lower.append((('fcanonicalize', 'a@{}'.format(bits)),
+                ('bcsel', ('ieq', ('iand', a, exp), 0), ('iand', a, sign), a)))
+
+
 
 def main():
     parser = argparse.ArgumentParser()
