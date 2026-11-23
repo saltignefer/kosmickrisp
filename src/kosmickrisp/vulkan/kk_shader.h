@@ -191,6 +191,7 @@ kk_nir_lower_descriptors(nir_shader *nir,
 bool kk_nir_add_device_barrier_workaround(nir_shader *nir);
 
 bool kk_nir_lower_poly(struct nir_shader *nir);
+bool kk_nir_lower_mesh_queries(nir_shader *nir);
 bool kk_nir_lower_null_images(nir_shader *nir);
 
 bool kk_nir_lower_textures(nir_shader *nir);

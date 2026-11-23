@@ -96,6 +96,12 @@ struct kk_per_draw_data {
 
    /* View a mesh draw renders, see kk_draw_mesh */
    uint32_t view_index;
+
+   /* Reports of the active task and mesh queries, 0 if none is active. See
+    * kk_nir_lower_mesh_queries. */
+   uint64_t task_invocations_query;
+   uint64_t mesh_invocations_query;
+   uint64_t mesh_primitives_query;
 };
 
 struct kk_attachment {

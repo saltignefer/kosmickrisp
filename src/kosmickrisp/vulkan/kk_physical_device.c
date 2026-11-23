@@ -503,7 +503,7 @@ kk_get_device_features(
       .taskShader = supported_extensions->EXT_mesh_shader,
       .multiviewMeshShader = supported_extensions->EXT_mesh_shader,
       .primitiveFragmentShadingRateMeshShader = false,
-      .meshShaderQueries = false,
+      .meshShaderQueries = supported_extensions->EXT_mesh_shader,
 
       /* VK_EXT_multi_draw */
       .multiDraw = true,

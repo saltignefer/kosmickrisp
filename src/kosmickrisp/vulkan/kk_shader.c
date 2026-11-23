@@ -789,6 +789,9 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
        * must see */
       NIR_PASS(_, nir, kk_nir_lower_mesh_multiview, state->mv->view_mask);
       NIR_PASS(_, nir, kk_nir_lower_poly);
+      NIR_PASS(_, nir, kk_nir_lower_mesh_queries);
+   } else if (nir->info.stage == MESA_SHADER_TASK) {
+      NIR_PASS(_, nir, kk_nir_lower_mesh_queries);
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, kk_nir_lower_fs_multiview, state->mv->view_mask);
 

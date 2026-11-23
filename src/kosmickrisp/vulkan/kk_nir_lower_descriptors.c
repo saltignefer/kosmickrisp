@@ -874,6 +874,74 @@ kk_nir_lower_poly(struct nir_shader *nir)
                                      &is_compute);
 }
 
+/* Adds value to the 64-bit query report whose address the per-draw data holds
+ * at offset, if a query is active. Metal has no 64-bit atomic add, so carry
+ * into the high half. */
+static void
+add_query_counter(nir_builder *b, uint32_t offset, nir_def *value)
+{
+   nir_def *per_draw = nir_load_per_draw_ptr_kk(b, 1, 64);
+   nir_def *report = nir_load_global(
+      b, 1, 64, nir_iadd_imm(b, per_draw, offset), .align_mul = 8);
+   nir_push_if(b, nir_ine_imm(b, report, 0));
+   {
+      nir_def *old = nir_global_atomic(b, 32, report, value,
+                                       .atomic_op = nir_atomic_op_iadd);
+      nir_push_if(b, nir_ult(b, nir_iadd(b, old, value), old));
+      nir_global_atomic(b, 32, nir_iadd_imm(b, report, 4), nir_imm_int(b, 1),
+                        .atomic_op = nir_atomic_op_iadd);
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+}
+
+/* Counts the invocations of the workgroup from its first invocation */
+static void
+count_invocations(nir_shader *nir, uint32_t offset)
+{
+   nir_builder b =
+      nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(nir)));
+   unsigned threads = nir->info.workgroup_size[0] *
+                      nir->info.workgroup_size[1] * nir->info.workgroup_size[2];
+
+   nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
+   add_query_counter(&b, offset, nir_imm_int(&b, threads));
+   nir_pop_if(&b, NULL);
+}
+
+static bool
+count_primitives(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_set_vertex_and_primitive_count)
+      return false;
+
+   /* The counts of the first invocation apply, see nir_to_msl */
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_push_if(b, nir_ieq_imm(b, nir_load_local_invocation_index(b), 0));
+   add_query_counter(b, kk_per_draw_offset(mesh_primitives_query),
+                     intr->src[1].ssa);
+   nir_pop_if(b, NULL);
+   return true;
+}
+
+/* Task and mesh shaders count their invocations and the primitives they
+ * generate for the queries the command buffer has active, since Metal has no
+ * statistics counters for them. */
+bool
+kk_nir_lower_mesh_queries(nir_shader *nir)
+{
+   if (nir->info.stage == MESA_SHADER_TASK) {
+      count_invocations(nir, kk_per_draw_offset(task_invocations_query));
+   } else {
+      assert(nir->info.stage == MESA_SHADER_MESH);
+      nir_shader_intrinsics_pass(nir, count_primitives, nir_metadata_none,
+                                 NULL);
+      count_invocations(nir, kk_per_draw_offset(mesh_invocations_query));
+   }
+
+   return nir_progress(true, nir_shader_get_entrypoint(nir), nir_metadata_none);
+}
+
 static bool
 kk_barrier_is_device_global(mesa_scope scope, nir_variable_mode mode)
 {

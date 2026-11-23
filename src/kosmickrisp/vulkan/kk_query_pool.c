@@ -37,7 +37,10 @@ kk_reports_per_query(struct kk_query_pool *pool)
    switch (pool->vk.query_type) {
    case VK_QUERY_TYPE_OCCLUSION:
    case VK_QUERY_TYPE_TIMESTAMP:
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
       return 1;
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+      return util_bitcount(pool->vk.pipeline_statistics);
    default:
       UNREACHABLE("Unsupported query type");
    }
@@ -69,6 +72,16 @@ kk_pool_is_ts(struct kk_query_pool *pool)
    return pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP;
 }
 
+/* Index of the first report of a query. Occlusion queries live in the global
+ * visibility buffer. */
+static uint32_t
+kk_query_report_index(struct kk_query_pool *pool, uint32_t query)
+{
+   if (kk_pool_is_oq(pool))
+      return kk_pool_index_ptr(pool)[query];
+   return query * kk_reports_per_query(pool);
+}
+
 static uint64_t
 kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
                      uint32_t query)
@@ -76,9 +89,8 @@ kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
    struct kk_bo *bo =
       kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
 
-   uint32_t index =
-      kk_pool_is_ts(pool) ? query : kk_pool_index_ptr(pool)[query];
-   return bo->gpu + pool->query_start + (index * sizeof(uint64_t));
+   return bo->gpu + pool->query_start +
+          (kk_query_report_index(pool, query) * sizeof(uint64_t));
 }
 
 static uint64_t
@@ -96,10 +108,8 @@ kk_query_report_map(struct kk_device *dev, struct kk_query_pool *pool,
       kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
 
    uint64_t *queries = (uint64_t *)(bo->cpu + pool->query_start);
-   uint32_t index =
-      kk_pool_is_ts(pool) ? query : kk_pool_index_ptr(pool)[query];
-
-   return (struct kk_query_report *)&queries[index];
+   return (
+      struct kk_query_report *)&queries[kk_query_report_index(pool, query)];
 }
 
 static void
@@ -151,10 +161,10 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
     * availability array. */
    uint32_t availability_size = 0;
    uint32_t index_size = 0;
-   if (!kk_pool_is_ts(pool)) {
+   if (!kk_pool_is_ts(pool))
       availability_size = pool->vk.query_count * sizeof(uint32_t);
+   if (kk_pool_is_oq(pool))
       index_size = sizeof(uint16_t) * pool->vk.query_count;
-   }
 
    pool->index_start = align(availability_size, sizeof(struct kk_query_report));
    uint32_t bo_size =
@@ -268,7 +278,7 @@ emit_zero_queries(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
    struct libkk_reset_query_args info = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
       .results = results_bo->gpu + pool->query_start,
-      .oq_index = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu + pool->index_start,
+      .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
 
       .first_query = first_index,
       .reports_per_query = kk_reports_per_query(pool),
@@ -432,12 +442,48 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    }
 }
 
+/* Points the task and mesh shaders at the reports of a query, or detaches
+ * them. With multiview, the first of the view queries gets all counts. */
+static void
+kk_set_mesh_query(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
+                  uint32_t query, bool active)
+{
+   struct kk_per_draw_data *per_draw = &cmd->state.gfx.per_draw_data;
+   uint64_t report =
+      active ? kk_query_report_addr(kk_cmd_buffer_device(cmd), pool, query)
+             : 0u;
+
+   if (pool->vk.query_type == VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT) {
+      per_draw->mesh_primitives_query = report;
+      return;
+   }
+
+   /* Statistics are reported in the order of their bits */
+   u_foreach_bit(stat, pool->vk.pipeline_statistics) {
+      VkQueryPipelineStatisticFlagBits bit = BITFIELD_BIT(stat);
+      if (bit == VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT)
+         per_draw->task_invocations_query = report;
+      else if (bit ==
+               VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT)
+         per_draw->mesh_invocations_query = report;
+
+      if (report)
+         report += sizeof(uint64_t);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                  uint32_t query, VkQueryControlFlags flags)
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+
+   if (!kk_pool_is_oq(pool)) {
+      kk_set_mesh_query(cmd, pool, query, true);
+      return;
+   }
+
    cmd->state.gfx.occlusion.mode = flags & VK_QUERY_CONTROL_PRECISE_BIT
                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
@@ -452,8 +498,13 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
-   cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
-   cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+
+   if (kk_pool_is_oq(pool)) {
+      cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
+      cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+   } else {
+      kk_set_mesh_query(cmd, pool, query, false);
+   }
 
    /* Make the query available. The Vulkan spec states:
     * If queries are used while executing a render pass instance that has
@@ -599,7 +650,7 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
    struct libkk_copy_queries_args args = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
       .results = results_bo->gpu + pool->query_start,
-      .oq_index = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu + pool->index_start,
+      .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
       .dst_addr = pDstRange->address,
       .dst_stride = pDstRange->stride,
       .first_query = firstQuery,
