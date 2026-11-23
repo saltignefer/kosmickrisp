@@ -29,6 +29,9 @@ struct nir_to_msl_ctx {
    bool uses_per_draw_data;
    /* Mesh outputs are staged in device memory, see msl_mesh_device_staging */
    bool mesh_device_staging;
+   /* 64-bit atomics on device or threadgroup memory, see kk_a64_device */
+   bool atomic64_device;
+   bool atomic64_shared;
    unsigned short indentlevel;
    struct io_slot_info inputs_info[NUM_TOTAL_VARYING_SLOTS];
    struct io_slot_info outputs_info[NUM_TOTAL_VARYING_SLOTS];

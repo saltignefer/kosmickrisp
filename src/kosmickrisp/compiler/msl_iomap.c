@@ -382,7 +382,9 @@ msl_mesh_device_staging(struct nir_to_msl_ctx *ctx, nir_shader *shader)
       2u * sizeof(uint32_t);
    /* Room for the alignment of each threadgroup variable */
    unsigned padding = 6u * 16u;
-   return shader->info.shared_size + staging + padding + mesh_output > 61440u;
+   unsigned locks = ctx->atomic64_shared ? MSL_ATOMIC64_TG_LOCKS * 4u : 0u;
+   return shader->info.shared_size + locks + staging + padding + mesh_output >
+          61440u;
 }
 
 /* Per-vertex outputs in the vertex struct as members of their own. Clip

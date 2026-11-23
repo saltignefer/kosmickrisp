@@ -52,6 +52,8 @@ struct kk_device_info {
    bool supports_32_bit_float_filtering;
    /* Sparse binding through Metal 4 placement sparse resources */
    bool supports_sparse;
+   /* 64-bit atomics emulated with a lock table, see MSL_ATOMIC64_LOCKS */
+   bool supports_atomic_int64;
 };
 
 struct kk_env_settings {

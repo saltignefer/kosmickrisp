@@ -108,6 +108,9 @@ struct kk_device {
     * MSL_MESH_STAGING_SIZE */
    struct kk_bo *mesh_staging;
 
+   /* Locks of 64-bit atomics, see MSL_ATOMIC64_LOCKS */
+   struct kk_bo *atomic64_locks;
+
    /* Object stage of mesh pipelines without task shader, see
     * KK_MESH_GRID_MAX_CHUNKS */
    mtl_library *mesh_grid_object;
@@ -140,6 +143,7 @@ void kk_device_add_texture_to_residency_set(struct kk_device *dev,
 void kk_device_remove_texture_from_residency_set(struct kk_device *dev,
                                                  mtl_texture *texture);
 void kk_device_make_resources_resident(struct kk_device *dev);
+void kk_device_reset_atomic64_locks(struct kk_device *dev);
 
 /* Required to create a sampler */
 mtl_sampler *kk_sampler_create(struct kk_device *dev,

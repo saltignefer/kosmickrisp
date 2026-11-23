@@ -30,6 +30,8 @@ enum kk_experimental {
    KK_EXPERIMENTAL_MESH_SHADER = 1ull << 3,
    /* Advertise sparse binding and residency on M3 and later */
    KK_EXPERIMENTAL_SPARSE = 1ull << 4,
+   /* Advertise 64-bit atomics on M3 and later, emulated with locks */
+   KK_EXPERIMENTAL_ATOMIC_INT64 = 1ull << 5,
 };
 
 extern enum kk_experimental kk_mesa_experimental_flags;

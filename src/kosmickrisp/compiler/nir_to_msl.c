@@ -119,6 +119,11 @@ emit_inputs(struct nir_to_msl_ctx *ctx, nir_shader *shader)
       P_IND(ctx, "device uchar *kk_mesh_staging [[buffer(%u)]]",
             MSL_MESH_STAGING_BUFFER);
    }
+   if (ctx->atomic64_device) {
+      P(ctx, ",\n");
+      P_IND(ctx, "device atomic_uint *kk_a64_locks [[buffer(%u)]]",
+            MSL_ATOMIC64_LOCK_BUFFER);
+   }
    P(ctx, "\n");
 }
 
@@ -135,12 +140,24 @@ output_type(nir_shader *shader)
    }
 }
 
+/* The 8u of KK_A64_TG_LOCKS in the 64-bit atomics helpers */
+static_assert(MSL_ATOMIC64_TG_LOCKS == 8u, "update KK_A64_TG_LOCKS");
+
 static void
 emit_local_vars(struct nir_to_msl_ctx *ctx, nir_shader *shader)
 {
    if (shader->info.shared_size) {
       P_IND(ctx, "threadgroup char shared_data[%d];\n",
             shader->info.shared_size);
+   }
+   if (ctx->atomic64_shared) {
+      /* Threadgroup memory starts out undefined */
+      P_IND(ctx, "threadgroup atomic_uint kk_a64_tg_locks[KK_A64_TG_LOCKS];\n");
+      P_IND(ctx, "if (gl_LocalInvocationIndex == 0u)\n");
+      P_IND(ctx, "    for (uint i = 0u; i < KK_A64_TG_LOCKS; i++)\n");
+      P_IND(ctx, "        atomic_store_explicit(&kk_a64_tg_locks[i], 0u, "
+                 "memory_order_relaxed);\n");
+      P_IND(ctx, "threadgroup_barrier(mem_flags::mem_threadgroup);\n");
    }
    if (shader->scratch_size) {
       /* KK_WORKAROUND_1 */
@@ -1020,6 +1037,260 @@ atomic_op_to_msl(nir_atomic_op op)
    }
 }
 
+/* Metal only has 64-bit min/max atomics on device memory and no 64-bit atomics
+ * on threadgroup memory, so every 64-bit atomic access runs under a 32-bit
+ * lock: one of MSL_ATOMIC64_LOCKS picked by address for device memory, one of
+ * KK_A64_TG_LOCKS per threadgroup for threadgroup memory. A thread holds at
+ * most one lock at a time, so there is no lock order to respect.
+ *
+ * The critical section has to sit in the branch that took the lock, inside the
+ * loop: lanes of the SIMD group that lost the race keep looping while the
+ * winner runs it and releases the lock. Spinning on the lock before entering
+ * it never lets the winner run. The fences order the plain 64-bit data
+ * accesses with the lock word; relaxed lock accesses alone lose updates. A
+ * plain 64-bit access is a single memory transaction, two 32-bit ones tear.
+ *
+ * Of the lanes waiting on the lock of the first active lane, only that lane
+ * competes for it. This keeps a SIMD group from hammering a hot lock with
+ * all its lanes, which makes a single hot lock about 1.5 times faster on M3
+ * Max. Contended operations still serialize at a few microseconds each, so a
+ * dispatch with millions of them on one address can trip the GPU watchdog.
+ */
+static const char msl_atomic64_library[] =
+   "#define KK_A64_ADD 0u\n"
+   "#define KK_A64_UMIN 1u\n"
+   "#define KK_A64_IMIN 2u\n"
+   "#define KK_A64_UMAX 3u\n"
+   "#define KK_A64_IMAX 4u\n"
+   "#define KK_A64_AND 5u\n"
+   "#define KK_A64_OR 6u\n"
+   "#define KK_A64_XOR 7u\n"
+   "#define KK_A64_XCHG 8u\n"
+   "#define KK_A64_CMPXCHG 9u\n"
+   "#define KK_A64_LOAD 10u\n"
+   "#define KK_A64_TG_LOCKS 8u\n"
+   "static inline ulong kk_a64_apply(uint op, ulong o, ulong a, ulong b)\n"
+   "{\n"
+   "   switch (op) {\n"
+   "   case KK_A64_ADD: return o + a;\n"
+   "   case KK_A64_UMIN: return min(o, a);\n"
+   "   case KK_A64_IMIN: return as_type<ulong>(min(as_type<long>(o), as_type<long>(a)));\n"
+   "   case KK_A64_UMAX: return max(o, a);\n"
+   "   case KK_A64_IMAX: return as_type<ulong>(max(as_type<long>(o), as_type<long>(a)));\n"
+   "   case KK_A64_AND: return o & a;\n"
+   "   case KK_A64_OR: return o | a;\n"
+   "   case KK_A64_XOR: return o ^ a;\n"
+   "   case KK_A64_XCHG: return a;\n"
+   "   case KK_A64_CMPXCHG: return o == a ? b : o;\n"
+   "   default: return o;\n"
+   "   }\n"
+   "}\n"
+   "#define KK_A64_LOCKED(LOCK, IDX, P, FLAGS, SCOPE)                             \\\n"
+   "   ulong old = 0ul;                                                         \\\n"
+   "   for (bool done = false; !done;) {                                        \\\n"
+   "      uint unlocked = 0u;                                                   \\\n"
+   "      bool compete = simd_is_first() || simd_broadcast_first(IDX) != (IDX); \\\n"
+   "      if (compete &&                                                        \\\n"
+   "          atomic_load_explicit(LOCK, memory_order_relaxed) == 0u &&         \\\n"
+   "          atomic_compare_exchange_weak_explicit(LOCK, &unlocked, 1u,        \\\n"
+   "                                                memory_order_relaxed,       \\\n"
+   "                                                memory_order_relaxed)) {    \\\n"
+   "         atomic_thread_fence(FLAGS, memory_order_seq_cst, SCOPE);           \\\n"
+   "         old = *(P);                                                        \\\n"
+   "         ulong v = kk_a64_apply(op, old, a, b);                             \\\n"
+   "         if (v != old)                                                      \\\n"
+   "            *(P) = v;                                                       \\\n"
+   "         atomic_thread_fence(FLAGS, memory_order_seq_cst, SCOPE);           \\\n"
+   "         atomic_store_explicit(LOCK, 0u, memory_order_relaxed);             \\\n"
+   "         done = true;                                                       \\\n"
+   "      }                                                                     \\\n"
+   "   }                                                                        \\\n"
+   "   return old;\n"
+   "static inline ulong kk_a64_device(device atomic_uint *locks, ulong addr,\n"
+   "                                  uint op, ulong a, ulong b)\n"
+   "{\n"
+   "   ulong h = addr >> 3;\n"
+   "   uint idx = uint(h ^ (h >> 11) ^ (h >> 23)) & (KK_A64_LOCKS - 1u);\n"
+   "   device atomic_uint *lock = &locks[idx];\n"
+   "   volatile coherent device ulong *p = (volatile coherent device ulong *)addr;\n"
+   "   KK_A64_LOCKED(lock, idx, p, mem_flags::mem_device, thread_scope_device)\n"
+   "}\n"
+   "static inline ulong kk_a64_threadgroup(threadgroup atomic_uint *locks,\n"
+   "                                       threadgroup char *data, uint offset,\n"
+   "                                       uint op, ulong a, ulong b)\n"
+   "{\n"
+   "   uint idx = (offset >> 3) & (KK_A64_TG_LOCKS - 1u);\n"
+   "   threadgroup atomic_uint *lock = &locks[idx];\n"
+   "   volatile threadgroup ulong *p = (volatile threadgroup ulong *)(data + offset);\n"
+   "   KK_A64_LOCKED(lock, idx, p, mem_flags::mem_threadgroup,\n"
+   "                 thread_scope_threadgroup)\n"
+   "}\n";
+
+enum msl_atomic64_mode {
+   MSL_ATOMIC64_NONE,
+   MSL_ATOMIC64_DEVICE,
+   MSL_ATOMIC64_SHARED,
+};
+
+/* Whether instr is a 64-bit atomic access needing the emulation above */
+static enum msl_atomic64_mode
+msl_atomic64_mode(nir_intrinsic_instr *instr)
+{
+   switch (instr->intrinsic) {
+   case nir_intrinsic_global_atomic:
+   case nir_intrinsic_global_atomic_swap:
+      return instr->def.bit_size == 64 ? MSL_ATOMIC64_DEVICE
+                                       : MSL_ATOMIC64_NONE;
+   case nir_intrinsic_shared_atomic:
+   case nir_intrinsic_shared_atomic_swap:
+      return instr->def.bit_size == 64 ? MSL_ATOMIC64_SHARED
+                                       : MSL_ATOMIC64_NONE;
+   case nir_intrinsic_load_global:
+      return (nir_intrinsic_access(instr) & ACCESS_ATOMIC) &&
+                   instr->def.bit_size == 64
+                ? MSL_ATOMIC64_DEVICE
+                : MSL_ATOMIC64_NONE;
+   case nir_intrinsic_store_global:
+      return (nir_intrinsic_access(instr) & ACCESS_ATOMIC) &&
+                   instr->src[0].ssa->bit_size == 64
+                ? MSL_ATOMIC64_DEVICE
+                : MSL_ATOMIC64_NONE;
+   case nir_intrinsic_load_shared:
+      return (nir_intrinsic_access(instr) & ACCESS_ATOMIC) &&
+                   instr->def.bit_size == 64
+                ? MSL_ATOMIC64_SHARED
+                : MSL_ATOMIC64_NONE;
+   case nir_intrinsic_store_shared:
+      return (nir_intrinsic_access(instr) & ACCESS_ATOMIC) &&
+                   instr->src[0].ssa->bit_size == 64
+                ? MSL_ATOMIC64_SHARED
+                : MSL_ATOMIC64_NONE;
+   default:
+      return MSL_ATOMIC64_NONE;
+   }
+}
+
+static void
+msl_gather_atomic64(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         switch (msl_atomic64_mode(nir_instr_as_intrinsic(instr))) {
+         case MSL_ATOMIC64_DEVICE:
+            ctx->atomic64_device = true;
+            break;
+         case MSL_ATOMIC64_SHARED:
+            ctx->atomic64_shared = true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
+}
+
+static const char *
+atomic64_op_to_msl(nir_atomic_op op)
+{
+   switch (op) {
+   case nir_atomic_op_iadd:
+      return "KK_A64_ADD";
+   case nir_atomic_op_umin:
+      return "KK_A64_UMIN";
+   case nir_atomic_op_imin:
+      return "KK_A64_IMIN";
+   case nir_atomic_op_umax:
+      return "KK_A64_UMAX";
+   case nir_atomic_op_imax:
+      return "KK_A64_IMAX";
+   case nir_atomic_op_iand:
+      return "KK_A64_AND";
+   case nir_atomic_op_ior:
+      return "KK_A64_OR";
+   case nir_atomic_op_ixor:
+      return "KK_A64_XOR";
+   case nir_atomic_op_xchg:
+      return "KK_A64_XCHG";
+   case nir_atomic_op_cmpxchg:
+      return "KK_A64_CMPXCHG";
+   default:
+      UNREACHABLE("Unhandled 64-bit atomic op");
+   }
+}
+
+/* Prints a call to the 64-bit atomic emulation, which returns the previous
+ * value. Helper invocations skip it: their stores are dropped, so they would
+ * never release the lock. */
+static void
+atomic64_call_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
+                     const char *op, nir_src *addr, nir_src *a, nir_src *b)
+{
+   if (ctx->shader->info.stage == MESA_SHADER_FRAGMENT)
+      P(ctx, "simd_is_helper_thread() ? 0ul : ");
+   if (msl_atomic64_mode(instr) == MSL_ATOMIC64_SHARED) {
+      P(ctx, "kk_a64_threadgroup(kk_a64_tg_locks, shared_data, %uu + ",
+        nir_intrinsic_base(instr));
+   } else {
+      P(ctx, "kk_a64_device(kk_a64_locks, ");
+   }
+   src_to_msl(ctx, addr);
+   P(ctx, ", %s, ", op);
+   if (a) {
+      P(ctx, "as_type<ulong>(");
+      src_to_msl(ctx, a);
+      P(ctx, ")");
+   } else {
+      P(ctx, "0ul");
+   }
+   P(ctx, ", ");
+   if (b) {
+      P(ctx, "as_type<ulong>(");
+      src_to_msl(ctx, b);
+      P(ctx, ")");
+   } else {
+      P(ctx, "0ul");
+   }
+   P(ctx, ");\n");
+}
+
+/* Atomic intrinsics with a destination, the "t%d = " is already printed for
+ * all but the swaps */
+static void
+atomic64_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+{
+   switch (instr->intrinsic) {
+   case nir_intrinsic_global_atomic:
+   case nir_intrinsic_shared_atomic:
+      atomic64_call_to_msl(ctx, instr,
+                           atomic64_op_to_msl(nir_intrinsic_atomic_op(instr)),
+                           &instr->src[0], &instr->src[1], NULL);
+      break;
+   case nir_intrinsic_global_atomic_swap:
+   case nir_intrinsic_shared_atomic_swap:
+      P_IND(ctx, "%s t%d = ", msl_type_for_def(ctx->types, &instr->def),
+            instr->def.index);
+      atomic64_call_to_msl(ctx, instr,
+                           atomic64_op_to_msl(nir_intrinsic_atomic_op(instr)),
+                           &instr->src[0], &instr->src[1], &instr->src[2]);
+      break;
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_shared:
+      atomic64_call_to_msl(ctx, instr, "KK_A64_LOAD", &instr->src[0], NULL,
+                           NULL);
+      break;
+   case nir_intrinsic_store_global:
+   case nir_intrinsic_store_shared:
+      P_INDENT(ctx);
+      atomic64_call_to_msl(ctx, instr, "KK_A64_XCHG", &instr->src[1],
+                           &instr->src[0], NULL);
+      break;
+   default:
+      UNREACHABLE("Not a 64-bit atomic");
+   }
+}
+
 static void
 atomic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
               const char *scope, bool shared)
@@ -1475,6 +1746,10 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    const nir_intrinsic_info *info = &nir_intrinsic_infos[instr->intrinsic];
    if (instrinsic_needs_dest_type(instr)) {
       P_IND(ctx, "t%d = ", instr->def.index);
+   }
+   if (msl_atomic64_mode(instr) != MSL_ATOMIC64_NONE) {
+      atomic64_to_msl(ctx, instr);
+      return;
    }
    switch (instr->intrinsic) {
    case nir_intrinsic_decl_reg: {
@@ -2917,6 +3192,12 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
    nir_index_blocks(impl);
    nir_index_ssa_defs(impl);
 
+   msl_gather_atomic64(ctx, impl);
+   /* The first invocation frees the threadgroup locks */
+   if (ctx->atomic64_shared)
+      BITSET_SET(ctx->shader->info.system_values_read,
+                 SYSTEM_VALUE_LOCAL_INVOCATION_INDEX);
+
    /* Task shaders launch the mesh grid from the first invocation */
    if (ctx->shader->info.stage == MESA_SHADER_TASK)
       BITSET_SET(ctx->shader->info.system_values_read,
@@ -3088,6 +3369,11 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
            ? 1u
            : 0u);
       P(&ctx, "%s", msl_float64_library);
+   }
+
+   if (ctx.atomic64_device || ctx.atomic64_shared) {
+      P(&ctx, "#define KK_A64_LOCKS %uu\n", MSL_ATOMIC64_LOCKS);
+      P(&ctx, "%s", msl_atomic64_library);
    }
 
    msl_emit_constant_data(&ctx, shader);

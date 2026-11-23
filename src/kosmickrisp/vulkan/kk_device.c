@@ -340,6 +340,14 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       memset(dev->mesh_staging->cpu, 0, MSL_MESH_STAGING_LOCKS * 4u);
    }
 
+   if (dev->vk.enabled_features.shaderBufferInt64Atomics) {
+      result = kk_alloc_bo(dev, &dev->vk.base, MSL_ATOMIC64_LOCKS * 4u, 256u,
+                           &dev->atomic64_locks);
+      if (result != VK_SUCCESS)
+         goto fail_mesh_staging;
+      kk_device_reset_atomic64_locks(dev);
+   }
+
    if (pdev->settings.gpu_capture_immediately) {
       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
       dev->gpu_capture_active = true;
@@ -349,6 +357,9 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    return VK_SUCCESS;
 
+fail_mesh_staging:
+   if (dev->mesh_staging)
+      kk_destroy_bo(dev, dev->mesh_staging);
 fail_lib:
    kk_device_finish_lib(dev);
 fail_sampler_heap:
@@ -372,6 +383,15 @@ fail_init:
 fail_alloc:
    vk_free(&dev->vk.alloc, dev);
    return result;
+}
+
+/* A shader that faults while holding a lock never releases it, which would
+ * hang every later 64-bit atomic on an address mapping to that lock */
+void
+kk_device_reset_atomic64_locks(struct kk_device *dev)
+{
+   if (dev->atomic64_locks)
+      memset(dev->atomic64_locks->cpu, 0, MSL_ATOMIC64_LOCKS * 4u);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -400,6 +420,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (dev->mesh_staging)
       kk_destroy_bo(dev, dev->mesh_staging);
+
+   if (dev->atomic64_locks)
+      kk_destroy_bo(dev, dev->atomic64_locks);
 
    if (dev->has_queue) {
       kk_queue_finish(dev, &dev->queue);

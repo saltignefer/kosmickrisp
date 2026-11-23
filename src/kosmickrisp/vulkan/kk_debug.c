@@ -25,6 +25,7 @@ const struct debug_named_value experimental_flags[] = {
    {"optimize_e5b9g9r9", KK_EXPERIMENTAL_OPTIMIZE_E5B9G9R9},
    {"mesh_shader", KK_EXPERIMENTAL_MESH_SHADER},
    {"sparse", KK_EXPERIMENTAL_SPARSE},
+   {"atomic_int64", KK_EXPERIMENTAL_ATOMIC_INT64},
    {NULL, 0},
 };
 

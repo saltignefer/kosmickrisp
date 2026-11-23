@@ -45,6 +45,7 @@ static void
 check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
 {
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+      kk_device_reset_atomic64_locks(dev);
       vk_device_set_lost(
          &dev->vk, "Command queue error: %s, with message \"%s\"",
          mtl_command_queue_error_to_string(data->error), data->error_message);

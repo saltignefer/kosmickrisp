@@ -77,7 +77,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .KHR_imageless_framebuffer = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_separate_depth_stencil_layouts = true,
-      .KHR_shader_atomic_int64 = false,
+      .KHR_shader_atomic_int64 = pdev->info.supports_atomic_int64,
       .KHR_shader_float_controls = true,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_subgroup_extended_types = true,
@@ -316,6 +316,7 @@ kk_get_device_features(
       .samplerMirrorClampToEdge = true,
       .scalarBlockLayout = true,
       .separateDepthStencilLayouts = true,
+      .shaderBufferInt64Atomics = info->supports_atomic_int64,
       .shaderFloat16 = true,
       .shaderInputAttachmentArrayDynamicIndexing = true,
       .shaderInputAttachmentArrayNonUniformIndexing = true,
@@ -323,6 +324,7 @@ kk_get_device_features(
       .shaderOutputLayer = true,
       .shaderOutputViewportIndex = true,
       .shaderSampledImageArrayNonUniformIndexing = true,
+      .shaderSharedInt64Atomics = info->supports_atomic_int64,
       .shaderStorageBufferArrayNonUniformIndexing = true,
       .shaderStorageImageArrayNonUniformIndexing = true,
       .shaderStorageTexelBufferArrayDynamicIndexing = true,
@@ -553,6 +555,9 @@ kk_get_device_properties(
    struct vk_properties *properties)
 {
    VkSampleCountFlags sample_counts = pdev->info.supported_sample_counts;
+   /* Shared memory 64-bit atomics add their locks to the threadgroup memory */
+   const uint32_t a64_tg_locks_B =
+      pdev->info.supports_atomic_int64 ? MSL_ATOMIC64_TG_LOCKS * 4u : 0u;
 
    uint64_t os_page_size = 4096;
    os_get_page_size(&os_page_size);
@@ -898,12 +903,15 @@ kk_get_device_properties(
       .maxTaskWorkGroupInvocations = 128,
       .maxTaskWorkGroupSize = {128, 128, 128},
       .maxTaskPayloadSize = 16384,
-      .maxTaskSharedMemorySize = 32752,
-      .maxTaskPayloadAndSharedMemorySize = 32752,
+      .maxTaskSharedMemorySize = 32752 - a64_tg_locks_B,
+      .maxTaskPayloadAndSharedMemorySize = 32752 - a64_tg_locks_B,
       .maxMeshWorkGroupTotalCount = (1u << 20) - 1u,
       .maxMeshWorkGroupCount = {65535, 65535, 65535},
       .maxMeshWorkGroupInvocations = 256,
       .maxMeshWorkGroupSize = {256, 256, 256},
+      /* Not reduced by the 32 B of 64-bit atomic locks, to keep the Vulkan
+       * minimum: a mesh shader with these atomics that uses all of the shared
+       * and output memory fails pipeline creation */
       .maxMeshSharedMemorySize = 28672,
       .maxMeshPayloadAndSharedMemorySize = 28672,
       .maxMeshOutputMemorySize = 32768,
@@ -1146,6 +1154,13 @@ get_metal_limits(struct kk_physical_device *pdev)
    pdev->info.supports_sparse =
       KK_EXPERIMENTAL(SPARSE) && pdev->info.gpu_apple_family >= 9 &&
       mtl_device_supports_placement_sparse(pdev->mtl_dev_handle);
+   /* The emulation relies on the native 64-bit loads, stores and fences of
+    * Apple9 GPUs */
+   pdev->info.supports_atomic_int64 =
+      KK_EXPERIMENTAL(ATOMIC_INT64) && pdev->info.gpu_apple_family >= 9;
+   /* Shared memory 64-bit atomics add their locks to the threadgroup memory */
+   if (pdev->info.supports_atomic_int64)
+      pdev->info.max_compute_shared_memory_size -= MSL_ATOMIC64_TG_LOCKS * 4u;
 
    /* Determine the supported MSL version based on the OS. The version used to
     * compile determines what features are available. */

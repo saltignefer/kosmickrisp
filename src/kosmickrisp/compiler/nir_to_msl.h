@@ -34,6 +34,15 @@ struct nir_to_msl_options {
 #define MSL_MESH_STAGING_BO_SIZE                                               \
    (MSL_MESH_STAGING_LOCKS * 4u + MSL_MESH_STAGING_SIZE)
 
+/* Metal has no 64-bit atomics on device memory besides min/max, so they run
+ * under one of MSL_ATOMIC64_LOCKS 32-bit locks, picked by hashing the address,
+ * in a device buffer bound at index 4. A lock word is 1 while held. */
+#define MSL_ATOMIC64_LOCK_BUFFER 4u
+#define MSL_ATOMIC64_LOCKS       65536u
+/* 64-bit atomics on shared memory use this many 32-bit locks in threadgroup
+ * memory, on top of the shared memory of the shader. */
+#define MSL_ATOMIC64_TG_LOCKS    8u
+
 /* Assumes nir_shader_gather_info has been called beforehand. */
 char *nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options);
 
