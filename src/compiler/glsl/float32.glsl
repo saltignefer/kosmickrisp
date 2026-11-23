@@ -230,7 +230,7 @@ __extractFloat32Exp(uint a)
 bool
 __feq32_nonnan(uint a, uint b)
 {
-   return (a == b) || ((a == 0u) && (((a | b)<<1) == 0u));
+   return (a == b) || (((a | b) << 1) == 0u);
 }
 
 /* Returns true if the single-precision floating-point value `a' is equal to the
@@ -300,7 +300,7 @@ __flt32_nonnan(uint a, uint b)
     *
     *    fneu(a, b) && (both_negative(a, b) != (a < b))
     */
-   bool lt = a < b;
+   bool lt = int(a) < int(b);
    bool both_negative = (a & b & 0x80000000u) != 0;
 
    return !__feq32_nonnan(a, b) && (lt != both_negative);
@@ -323,7 +323,7 @@ __flt32_nonnan_minmax(uint a, uint b)
     *
     * XOR is again implemented using !=.
     */
-   bool lt = a < b;
+   bool lt = int(a) < int(b);
    bool both_negative = (a & b & 0x80000000u) != 0;
 
    return (lt != both_negative);
