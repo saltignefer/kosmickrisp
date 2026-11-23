@@ -5,6 +5,7 @@
 
 #include "kk_sparse.h"
 
+#include "kk_bo.h"
 #include "kk_buffer.h"
 #include "kk_device.h"
 #include "kk_device_memory.h"
@@ -58,6 +59,85 @@ kk_image_plane_init_sparse(struct kk_device *dev, struct kk_image_plane *plane)
    sparse->layer_pages = page + sparse->tail_pages;
 
    return VK_SUCCESS;
+}
+
+VkResult
+kk_image_plane_init_residency_table(struct kk_device *dev,
+                                    struct kk_image_plane *plane)
+{
+   const struct kk_sparse_image_layout *sparse = &plane->sparse;
+   const uint64_t pages = sparse->layer_pages * plane->layout.layers;
+   const uint64_t size_B = sizeof(struct kk_sparse_residency_table) +
+                           DIV_ROUND_UP(pages, 32u) * sizeof(uint32_t);
+
+   VkResult result =
+      kk_alloc_bo(dev, &dev->vk.base, size_B, 16u, &plane->residency_table);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* kk_alloc_bo may round the size up, and uploads copy all of it */
+   struct kk_sparse_residency_table *table =
+      calloc(1, plane->residency_table->size_B);
+   if (!table) {
+      kk_destroy_bo(dev, plane->residency_table);
+      plane->residency_table = NULL;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   plane->residency_cpu = table;
+   table->tile_width_px = sparse->tile_px.x;
+   table->tile_height_px = sparse->tile_px.y;
+   table->tail_level = sparse->tail_level;
+   table->layer_pages = sparse->layer_pages;
+   table->last_page = pages - 1u;
+   for (uint32_t level = 0u; level <= sparse->tail_level; level++)
+      table->level_page[level] = sparse->level_page[level];
+   for (uint32_t level = 0u; level < sparse->tail_level; level++)
+      table->level_tiles_x[level] = sparse->level_tiles[level].x;
+   memcpy(plane->residency_table->cpu, table, size_B);
+
+   return VK_SUCCESS;
+}
+
+static void
+kk_sparse_set_resident(struct kk_image_plane *plane, uint64_t page,
+                       uint64_t count, bool resident)
+{
+   if (!plane->residency_table)
+      return;
+
+   struct kk_sparse_residency_table *table = plane->residency_cpu;
+   const uint64_t end = MIN2(page + count, (uint64_t)table->last_page + 1u);
+   for (; page < end; page++) {
+      const uint32_t bit = 1u << (page % 32u);
+      if (resident)
+         table->resident[page / 32u] |= bit;
+      else
+         table->resident[page / 32u] &= ~bit;
+   }
+}
+
+/* Image binds only cover levels before the mip tail */
+static void
+kk_sparse_set_region_resident(struct kk_image_plane *plane,
+                              const struct mtl_sparse_texture_mapping *m)
+{
+   const struct kk_sparse_image_layout *sparse = &plane->sparse;
+   if (!plane->residency_table || m->level >= sparse->tail_level)
+      return;
+
+   const struct mtl_size tiles = sparse->level_tiles[m->level];
+   const uint64_t x_end = MIN2(m->origin.x + m->size.x, tiles.x);
+   const uint64_t y_end = MIN2(m->origin.y + m->size.y, tiles.y);
+   const uint64_t z_end = MIN2(m->origin.z + m->size.z, tiles.z);
+   for (uint64_t z = m->origin.z; z < z_end; z++) {
+      for (uint64_t y = m->origin.y; y < y_end; y++) {
+         const uint64_t page = m->slice * sparse->layer_pages +
+                               sparse->level_page[m->level] +
+                               (z * tiles.y + y) * tiles.x + m->origin.x;
+         if (x_end > m->origin.x)
+            kk_sparse_set_resident(plane, page, x_end - m->origin.x, m->map);
+      }
+   }
 }
 
 /* Vulkan standard sparse image block shapes in texel blocks, indexed by
@@ -255,11 +335,12 @@ kk_sparse_bind_image_opaque(struct kk_queue *queue,
       const VkSparseMemoryBind *bind = &info->pBinds[i];
       mtl_heap *heap = kk_sparse_heap(bind->memory);
       const uint64_t page = bind->resourceOffset / KK_SPARSE_PAGE_B;
-      kk_sparse_opaque_to_regions(
-         &plane->sparse, page,
-         page + DIV_ROUND_UP(bind->size, KK_SPARSE_PAGE_B),
-         bind->memoryOffset / KK_SPARSE_PAGE_B, heap != NULL, mappings);
+      const uint64_t count = DIV_ROUND_UP(bind->size, KK_SPARSE_PAGE_B);
+      kk_sparse_opaque_to_regions(&plane->sparse, page, page + count,
+                                  bind->memoryOffset / KK_SPARSE_PAGE_B,
+                                  heap != NULL, mappings);
       kk_sparse_update_texture(queue, plane->mtl_handle, heap, mappings);
+      kk_sparse_set_resident(plane, page, count, heap != NULL);
       unmaps |= heap == NULL;
    }
 
@@ -292,47 +373,174 @@ kk_sparse_bind_image(struct kk_queue *queue,
       };
       util_dynarray_append(mappings, m);
       kk_sparse_update_texture(queue, plane->mtl_handle, heap, mappings);
+      kk_sparse_set_region_resident(plane, &m);
       unmaps |= heap == NULL;
    }
 
    return unmaps;
 }
 
+struct kk_sparse_upload {
+   struct kk_image_plane *plane;
+   struct kk_bo *bo;
+};
+
 struct kk_sparse_barrier {
+   struct kk_device *dev;
+   struct kk_queue *queue;
    mtl_command_allocator *allocator;
    mtl_command_buffer *cmd_buf;
+   mtl_compute_encoder *encoder;
+   /* Copies of the residency tables of the bound images, struct
+    * kk_sparse_upload */
+   struct util_dynarray uploads;
 };
+
+static void
+kk_sparse_barrier_destroy(struct kk_sparse_barrier *barrier)
+{
+   util_dynarray_foreach(&barrier->uploads, struct kk_sparse_upload, upload)
+      kk_destroy_bo(barrier->dev, upload->bo);
+   util_dynarray_fini(&barrier->uploads);
+   if (barrier->cmd_buf)
+      mtl_release(barrier->cmd_buf);
+   if (barrier->allocator)
+      mtl_release(barrier->allocator);
+   free(barrier);
+}
 
 static void
 kk_sparse_barrier_done(struct mtl_feedback_data *data)
 {
    struct kk_sparse_barrier *barrier = data->user_data;
-   mtl_release(barrier->cmd_buf);
-   mtl_release(barrier->allocator);
-   free(barrier);
+   struct kk_queue *queue = barrier->queue;
+   kk_sparse_barrier_destroy(barrier);
+
+   mtx_lock(&queue->mutex);
+   kk_queue_end_commit_locked(queue);
+   mtx_unlock(&queue->mutex);
+}
+
+/* Allocates the copy of the residency table of each plane of the image, so
+ * no allocation can fail once Metal got the mappings */
+static VkResult
+kk_sparse_alloc_uploads(struct kk_sparse_barrier *barrier,
+                        struct kk_image *image)
+{
+   for (uint8_t p = 0; p < image->plane_count; p++) {
+      struct kk_image_plane *plane = &image->planes[p];
+      if (!plane->residency_table)
+         continue;
+
+      bool found = false;
+      util_dynarray_foreach(&barrier->uploads, struct kk_sparse_upload, upload)
+         found |= upload->plane == plane;
+      if (found)
+         continue;
+
+      struct kk_sparse_upload upload = {.plane = plane};
+      VkResult result =
+         kk_alloc_bo(barrier->dev, &barrier->dev->vk.base,
+                     plane->residency_table->size_B, 4u, &upload.bo);
+      if (result != VK_SUCCESS)
+         return result;
+      util_dynarray_append(&barrier->uploads, upload);
+   }
+   return VK_SUCCESS;
+}
+
+VkResult
+kk_queue_prepare_sparse(struct kk_queue *queue,
+                        const struct vk_queue_submit *submit,
+                        struct kk_sparse_barrier **barrier_out)
+{
+   *barrier_out = NULL;
+   if (!submit->buffer_bind_count && !submit->image_opaque_bind_count &&
+       !submit->image_bind_count)
+      return VK_SUCCESS;
+
+   struct kk_device *dev = kk_queue_device(queue);
+   struct kk_sparse_barrier *barrier = calloc(1, sizeof(*barrier));
+   if (!barrier)
+      return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   barrier->dev = dev;
+   barrier->queue = queue;
+   barrier->uploads = (struct util_dynarray)UTIL_DYNARRAY_INIT;
+
+   VkResult result = VK_SUCCESS;
+   for (uint32_t i = 0; i < submit->image_opaque_bind_count; i++) {
+      VK_FROM_HANDLE(kk_image, image, submit->image_opaque_binds[i].image);
+      if (result == VK_SUCCESS)
+         result = kk_sparse_alloc_uploads(barrier, image);
+   }
+   for (uint32_t i = 0; i < submit->image_bind_count; i++) {
+      VK_FROM_HANDLE(kk_image, image, submit->image_binds[i].image);
+      if (result == VK_SUCCESS)
+         result = kk_sparse_alloc_uploads(barrier, image);
+   }
+
+   barrier->allocator = mtl_new_command_allocator(dev->mtl_handle);
+   barrier->cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
+   if (result == VK_SUCCESS && (!barrier->allocator || !barrier->cmd_buf))
+      result = vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   /* Commands run when committed, so they can be recorded before Metal gets
+    * the mappings */
+   if (result == VK_SUCCESS) {
+      mtl_begin_command_buffer(barrier->cmd_buf, barrier->allocator);
+      barrier->encoder = mtl_new_compute_command_encoder(barrier->cmd_buf);
+      if (!barrier->encoder) {
+         mtl_end_command_buffer(barrier->cmd_buf);
+         result = vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
+   if (result != VK_SUCCESS) {
+      kk_sparse_barrier_destroy(barrier);
+      return result;
+   }
+
+   *barrier_out = barrier;
+   return VK_SUCCESS;
 }
 
 /* Metal applies mapping updates asynchronously. Work committed later, and
  * the queue's later event signals, only observe them once a command buffer
- * waited on the resource state stage. */
+ * waited on the resource state stage. The same command buffer copies the
+ * residency tables changed by the binds, so work still running before the
+ * binds does not see them. */
 static void
-kk_queue_sparse_barrier(struct kk_queue *queue)
+kk_queue_sparse_barrier(struct kk_queue *queue,
+                        struct kk_sparse_barrier *barrier)
 {
    struct kk_device *dev = kk_queue_device(queue);
-   struct kk_sparse_barrier *barrier = malloc(sizeof(*barrier));
-   if (!barrier)
-      return;
 
-   barrier->allocator = mtl_new_command_allocator(dev->mtl_handle);
-   barrier->cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
-   mtl_begin_command_buffer(barrier->cmd_buf, barrier->allocator);
-   mtl_compute_encoder *encoder =
-      mtl_new_compute_command_encoder(barrier->cmd_buf);
+   mtl_compute_encoder *encoder = barrier->encoder;
+   barrier->encoder = NULL;
    mtl_barrier_after_queue_stages(encoder, MTL_STAGE_RESOURCE_STATE,
                                   MTL_STAGE_ALL);
+   util_dynarray_foreach(&barrier->uploads, struct kk_sparse_upload, upload) {
+      struct kk_image_plane *plane = upload->plane;
+      const uint64_t size_B = plane->residency_table->size_B;
+      memcpy(upload->bo->cpu, plane->residency_cpu, size_B);
+      mtl_copy_from_buffer_to_buffer(encoder, upload->bo->map, 0u,
+                                     plane->residency_table->map, 0u, size_B);
+   }
+   /* Later work, and the copies of later binds, see the tables */
+   if (barrier->uploads.size)
+      mtl_barrier_after_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_ALL);
    mtl_end_encoding(encoder);
    mtl_release(encoder);
    mtl_end_command_buffer(barrier->cmd_buf);
+
+   /* The uploads must be resident */
+   if (barrier->uploads.size)
+      kk_device_make_resources_resident(dev);
+
+   mtx_lock(&queue->mutex);
+   queue->commits_in_flight++;
+   mtx_unlock(&queue->mutex);
 
    mtl_commit_options *options = mtl_new_commit_options();
    mtl_commit_options_add_feedback_handler(options, kk_sparse_barrier_done,
@@ -343,10 +551,10 @@ kk_queue_sparse_barrier(struct kk_queue *queue)
 
 void
 kk_queue_bind_sparse(struct kk_queue *queue,
-                     const struct vk_queue_submit *submit)
+                     const struct vk_queue_submit *submit,
+                     struct kk_sparse_barrier *barrier)
 {
-   if (!submit->buffer_bind_count && !submit->image_opaque_bind_count &&
-       !submit->image_bind_count)
+   if (!barrier)
       return;
 
    struct util_dynarray mappings = UTIL_DYNARRAY_INIT;
@@ -372,5 +580,5 @@ kk_queue_bind_sparse(struct kk_queue *queue,
          queue->sparse_flush.heap, &flush, 1u);
    }
 
-   kk_queue_sparse_barrier(queue);
+   kk_queue_sparse_barrier(queue, barrier);
 }

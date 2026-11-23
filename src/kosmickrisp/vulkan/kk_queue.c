@@ -58,6 +58,17 @@ commit_callback(struct mtl_feedback_data *data)
    check_device_lost((struct kk_device *)data->user_data, data);
 }
 
+void
+kk_queue_end_commit_locked(struct kk_queue *queue)
+{
+   assert(queue->commits_in_flight > 0u);
+   if (--queue->commits_in_flight == 0u) {
+      kk_ResetCommandPool(kk_device_to_handle(kk_queue_device(queue)),
+                          kk_cmd_pool_to_handle(queue->cmd_pool), 0u);
+      cnd_broadcast(&queue->cond);
+   }
+}
+
 static void
 rerecord_commit_callback(struct mtl_feedback_data *data)
 {
@@ -73,12 +84,7 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
 
    kk_queue_release_cmd_buffer_locked(queue, commit->cmd);
 
-   assert(queue->commits_in_flight > 0u);
-   if (--queue->commits_in_flight == 0u) {
-      kk_ResetCommandPool(kk_device_to_handle(dev),
-                          kk_cmd_pool_to_handle(queue->cmd_pool), 0u);
-      cnd_broadcast(&queue->cond);
-   }
+   kk_queue_end_commit_locked(queue);
 
    mtx_unlock(&queue->mutex);
 
@@ -183,6 +189,13 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (vk_queue_is_lost(&queue->vk))
       return VK_ERROR_DEVICE_LOST;
 
+   /* Allocate what sparse binds need before the queue waits for anything, so
+    * a failure leaves no wait behind */
+   struct kk_sparse_barrier *sparse = NULL;
+   VkResult result = kk_queue_prepare_sparse(queue, submit, &sparse);
+   if (result != VK_SUCCESS)
+      return result;
+
    for (struct vk_sync_wait *wait = submit->waits,
                             *end = submit->waits + submit->wait_count;
         wait != end; ++wait) {
@@ -196,7 +209,7 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * Otherwise, users are playing with fire. */
    kk_device_make_resources_resident(dev);
 
-   kk_queue_bind_sparse(queue, submit);
+   kk_queue_bind_sparse(queue, submit, sparse);
 
    for (uint32_t i = 0; i < submit->command_buffer_count; ++i) {
       struct kk_cmd_buffer *cmd_buffer =
@@ -210,7 +223,7 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       /* Metal's command buffers are one time use, re-record multiple
        * submissions. */
       if (cmd_buffer->submitted) {
-         VkResult result = rerecord_and_commit_cmd_buffer(queue, cmd_buffer);
+         result = rerecord_and_commit_cmd_buffer(queue, cmd_buffer);
          if (result != VK_SUCCESS)
             return result;
       } else if (kk_cmd_buffer_has_work(cmd_buffer)) {

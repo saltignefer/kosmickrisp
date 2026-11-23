@@ -54,6 +54,11 @@ struct kk_image_plane {
    mtl_texture *mtl_handle;
    /* Metal handle with 2D array type for 3D images */
    mtl_texture *mtl_handle_array;
+   /* Sparse residency of storage images, see kk_sparse_residency_table. Binds
+    * update the CPU copy, and the queue copies it to the table after the
+    * waits of the bind. */
+   struct kk_bo *residency_table;
+   struct kk_sparse_residency_table *residency_cpu;
    uint64_t addr;
 };
 

@@ -13,6 +13,7 @@
 #include "kk_descriptor_set_layout.h"
 #include "kk_device.h"
 #include "kk_entrypoints.h"
+#include "kk_image.h"
 #include "kk_image_view.h"
 #include "kk_physical_device.h"
 #include "kk_sampler.h"
@@ -167,6 +168,16 @@ get_storage_image_view_desc(
 
       assert(view->planes[plane].storage_gpu_resource_id);
       desc.image_gpu_resource_id = view->planes[plane].storage_gpu_resource_id;
+
+      const struct kk_image *image =
+         container_of(view->vk.image, struct kk_image, vk);
+      const struct kk_bo *table =
+         image->planes[view->planes[plane].image_plane].residency_table;
+      if (table) {
+         desc.residency_table_addr = table->gpu;
+         desc.residency_base_level = view->vk.base_mip_level;
+         desc.residency_base_layer = view->vk.base_array_layer;
+      }
    }
 
    assert(sizeof(desc) <= dst_size);
@@ -229,7 +240,7 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
                        const VkBufferView bufferView, uint32_t binding,
                        uint32_t elem)
 {
-   struct kk_storage_image_descriptor desc = {};
+   struct kk_texel_buffer_descriptor desc = {};
    if (bufferView != VK_NULL_HANDLE) {
       VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
 

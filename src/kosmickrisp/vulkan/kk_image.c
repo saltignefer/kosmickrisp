@@ -7,6 +7,7 @@
 
 #include "kk_image.h"
 
+#include "kk_bo.h"
 #include "kk_device.h"
 #include "kk_device_memory.h"
 #include "kk_entrypoints.h"
@@ -713,6 +714,9 @@ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
       mtl_release(plane->mtl_handle);
    if (plane->mtl_handle_array != NULL)
       mtl_release(plane->mtl_handle_array);
+   if (plane->residency_table != NULL)
+      kk_destroy_bo(dev, plane->residency_table);
+   free(plane->residency_cpu);
 }
 
 static void
@@ -750,6 +754,16 @@ kk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       kk_image_finish(dev, image, pAllocator);
       vk_free2(&dev->vk.alloc, pAllocator, image);
       return result;
+   }
+
+   if ((image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
+       (image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+      result = kk_image_plane_init_residency_table(dev, &image->planes[0]);
+      if (result != VK_SUCCESS) {
+         kk_image_finish(dev, image, pAllocator);
+         vk_free2(&dev->vk.alloc, pAllocator, image);
+         return result;
+      }
    }
 
    /* Metal requires the sparse texture itself to be resident for its mapped

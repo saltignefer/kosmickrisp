@@ -46,6 +46,11 @@ kk_queue_device(struct kk_queue *queue)
    return (struct kk_device *)queue->vk.base.device;
 }
 
+/* Commits whose completion handler uses the device count in
+ * commits_in_flight, so the queue waits for them before it goes away. Call
+ * this with the queue mutex held from the handler. */
+void kk_queue_end_commit_locked(struct kk_queue *queue);
+
 VkResult kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
                        const VkDeviceQueueCreateInfo *pCreateInfo,
                        uint32_t index_in_family);

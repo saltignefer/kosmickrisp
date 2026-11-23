@@ -10,6 +10,7 @@
 #include "kk_descriptor_set.h"
 #include "kk_descriptor_set_layout.h"
 #include "kk_shader.h"
+#include "kk_sparse.h"
 
 #include "kosmickrisp/compiler/nir_to_msl.h"
 
@@ -358,6 +359,110 @@ load_resource_deref_desc(nir_builder *b, unsigned num_components,
    get_resource_deref_binding(b, deref, &set, &binding, &index);
    return load_descriptor(b, num_components, bit_size, set, binding, index,
                           offset_B, ctx);
+}
+
+static nir_def *
+load_residency_table(nir_builder *b, nir_def *table, unsigned offset_B)
+{
+   return nir_load_global(b, 1, 32, nir_iadd_imm(b, table, offset_B));
+}
+
+static nir_def *
+load_residency_table_array(nir_builder *b, nir_def *table, unsigned offset_B,
+                           nir_def *index)
+{
+   nir_def *offset = nir_u2u64(b, nir_imul_imm(b, index, sizeof(uint32_t)));
+   return load_residency_table(b, nir_iadd(b, table, offset), offset_B);
+}
+
+/* A one component sparse image load only queries residency, see
+ * msl_nir_lower_sparse. Look the texel up in the residency table of the
+ * image, see kk_sparse_residency_table. Images without one are resident. */
+static bool
+lower_image_residency(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct lower_descriptors_ctx *ctx = data;
+   if (intr->intrinsic != nir_intrinsic_image_deref_sparse_load ||
+       intr->def.num_components != 1)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   /* Texel buffers have no residency table, nor room for its address in
+    * their descriptor, see kk_texel_buffer_descriptor. They are resident. */
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   if (dim == GLSL_SAMPLER_DIM_BUF) {
+      nir_def_replace(&intr->def, nir_imm_int(b, 1));
+      return true;
+   }
+
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_def *coord = intr->src[1].ssa;
+   nir_def *x = nir_channel(b, coord, 0);
+   nir_def *y = nir_channel(b, coord, 1);
+
+   /* Sparse residency images are 2D, cube or multisampled. Cube faces and
+    * layers are 2D array layers, and the third coordinate of cube and cube
+    * array images is layer * 6 + face already. */
+   nir_def *layer = nir_imm_int(b, 0);
+   if (dim == GLSL_SAMPLER_DIM_CUBE || nir_intrinsic_image_array(intr))
+      layer = nir_channel(b, coord, 2);
+   nir_def *lod =
+      dim == GLSL_SAMPLER_DIM_MS ? nir_imm_int(b, 0) : intr->src[3].ssa;
+
+   nir_def *table = load_resource_deref_desc(
+      b, 1, 64, deref,
+      offsetof(struct kk_storage_image_descriptor, residency_table_addr), ctx);
+   nir_def *base = load_resource_deref_desc(
+      b, 2, 32, deref,
+      offsetof(struct kk_storage_image_descriptor, residency_base_level), ctx);
+
+   nir_def *resident;
+   nir_push_if(b, nir_ine_imm(b, table, 0));
+   {
+      nir_def *level = nir_iadd(b, lod, nir_channel(b, base, 0));
+      layer = nir_iadd(b, layer, nir_channel(b, base, 1));
+
+#define TABLE_OFFSET(member) offsetof(struct kk_sparse_residency_table, member)
+      static_assert(TABLE_OFFSET(tile_height_px) == 4 &&
+                       TABLE_OFFSET(tail_level) == 8 &&
+                       TABLE_OFFSET(layer_pages) == 12 &&
+                       TABLE_OFFSET(last_page) == 16,
+                    "residency table header order");
+      nir_def *header = nir_load_global(b, 4, 32, table);
+      nir_def *tile_w = nir_channel(b, header, 0);
+      nir_def *tile_h = nir_channel(b, header, 1);
+      nir_def *tail_level = nir_channel(b, header, 2);
+      nir_def *layer_pages = nir_channel(b, header, 3);
+      nir_def *last_page =
+         load_residency_table(b, table, TABLE_OFFSET(last_page));
+
+      /* The tail is resident if its first page is */
+      nir_def *in_tail = nir_uge(b, level, tail_level);
+      level = nir_umin(b, level, tail_level);
+      nir_def *level_page =
+         load_residency_table_array(b, table, TABLE_OFFSET(level_page), level);
+      nir_def *tiles_x = load_residency_table_array(
+         b, table, TABLE_OFFSET(level_tiles_x),
+         nir_umin(b, level, nir_imm_int(b, KK_MAX_MIP_LEVELS - 1)));
+      nir_def *tile = nir_iadd(b, nir_imul(b, nir_udiv(b, y, tile_h), tiles_x),
+                               nir_udiv(b, x, tile_w));
+      tile = nir_bcsel(b, in_tail, nir_imm_int(b, 0), tile);
+
+      nir_def *page = nir_iadd(b, nir_imul(b, layer, layer_pages),
+                               nir_iadd(b, level_page, tile));
+      page = nir_umin(b, page, last_page);
+      nir_def *word = load_residency_table_array(
+         b, table, TABLE_OFFSET(resident), nir_ushr_imm(b, page, 5));
+      resident = nir_ubitfield_extract(b, word, nir_iand_imm(b, page, 31),
+                                       nir_imm_int(b, 1));
+#undef TABLE_OFFSET
+   }
+   nir_push_else(b, NULL);
+   nir_def *non_sparse = nir_imm_int(b, 1);
+   nir_pop_if(b, NULL);
+   nir_def_replace(&intr->def, nir_if_phi(b, resident, non_sparse));
+   return true;
 }
 
 static bool
@@ -813,6 +918,10 @@ kk_nir_lower_descriptors(nir_shader *nir,
          ctx.set_layouts[s] = vk_to_kk_descriptor_set_layout(set_layouts[s]);
    }
 
+   /* Residency lookups add control flow */
+   bool pass_lower_residency = nir_shader_intrinsics_pass(
+      nir, lower_image_residency, nir_metadata_none, &ctx);
+
    /* First lower everything but complex SSBOs, then lower complex SSBOs.
     *
     * TODO: See if we can unify this, not sure if the fast path matters on
@@ -824,7 +933,7 @@ kk_nir_lower_descriptors(nir_shader *nir,
    bool pass_lower_ssbo = nir_shader_intrinsics_pass(
       nir, lower_ssbo_descriptor, nir_metadata_control_flow, &ctx);
 
-   return pass_lower_descriptors || pass_lower_ssbo;
+   return pass_lower_residency || pass_lower_descriptors || pass_lower_ssbo;
 }
 
 static bool
