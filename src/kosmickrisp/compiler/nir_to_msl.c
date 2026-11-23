@@ -2605,6 +2605,12 @@ tex_coord_swizzle(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
 }
 
 static void
+tex_op_end(struct nir_to_msl_ctx *ctx, bool residency)
+{
+   P(ctx, residency ? ").resident() ? 1u : 0u);\n" : ");\n");
+}
+
+static void
 tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
 {
    nir_src *texhandle = nir_tex_get_src(tex, nir_tex_src_texture_handle);
@@ -2613,6 +2619,19 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
    assert(!nir_tex_get_src(tex, nir_tex_src_projector));
 
    P_IND(ctx, "t%d = ", tex->def.index);
+
+   /* Only the residency of the texels, see msl_nir_lower_sparse */
+   bool residency = tex->backend_flags & MSL_TEX_FLAG_SPARSE_RESIDENCY;
+   const char *sparse = residency ? "sparse_" : "";
+   if (residency) {
+      const char *type = msl_type_for_def(ctx->types, &tex->def);
+      /* Sparse texel buffers have no residency in MSL */
+      if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+         P(ctx, "%s(1u);\n", type);
+         return;
+      }
+      P(ctx, "%s(", type);
+   }
 
    switch (tex->op) {
    case nir_texop_tex:
@@ -2628,9 +2647,9 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       nir_src *comparator = nir_tex_get_src(tex, nir_tex_src_comparator);
       src_to_msl(ctx, texhandle);
       if (comparator) {
-         P(ctx, ".sample_compare(");
+         P(ctx, ".%ssample_compare(", sparse);
       } else {
-         P(ctx, ".sample(");
+         P(ctx, ".%ssample(", sparse);
       }
       src_to_msl(ctx, sampler);
       P(ctx, ", ");
@@ -2665,28 +2684,28 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
          P(ctx, ", ");
          src_to_msl(ctx, offset);
       }
-      P(ctx, ");\n");
+      tex_op_end(ctx, residency);
       break;
    }
    case nir_texop_txf: {
       src_to_msl(ctx, texhandle);
-      P(ctx, ".read(");
+      P(ctx, ".%sread(", sparse);
       tex_coord_swizzle(ctx, tex);
       nir_src *lod = nir_tex_get_src(tex, nir_tex_src_lod);
       if (lod) {
          P(ctx, ", ");
          src_to_msl(ctx, lod);
       }
-      P(ctx, ");\n");
+      tex_op_end(ctx, residency);
       break;
    }
    case nir_texop_txf_ms:
       src_to_msl(ctx, texhandle);
-      P(ctx, ".read(");
+      P(ctx, ".%sread(", sparse);
       tex_coord_swizzle(ctx, tex);
       P(ctx, ", ");
       src_to_msl(ctx, nir_tex_get_src(tex, nir_tex_src_ms_index));
-      P(ctx, ");\n");
+      tex_op_end(ctx, residency);
       break;
    case nir_texop_txs: {
       nir_src *lod = nir_tex_get_src(tex, nir_tex_src_lod);
@@ -2737,9 +2756,9 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       nir_src *comparator = nir_tex_get_src(tex, nir_tex_src_comparator);
       src_to_msl(ctx, texhandle);
       if (comparator) {
-         P(ctx, ".gather_compare(");
+         P(ctx, ".%sgather_compare(", sparse);
       } else {
-         P(ctx, ".gather(");
+         P(ctx, ".%sgather(", sparse);
       }
       src_to_msl(ctx, sampler);
       P(ctx, ", ");
@@ -2764,7 +2783,7 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
          P(ctx, ", component::%c", "xyzw"[tex->component]);
       }
 
-      P(ctx, ");\n");
+      tex_op_end(ctx, residency);
       break;
    }
 

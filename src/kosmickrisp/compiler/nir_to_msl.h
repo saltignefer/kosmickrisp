@@ -123,6 +123,10 @@ bool msl_nir_alu_is_fp64(const nir_alu_instr *alu);
 bool msl_nir_lower_fp64(nir_shader *nir);
 bool msl_nir_flush_fp32_denorms(nir_shader *nir);
 
+/* nir_tex_instr::backend_flags bit of texture operations that only return
+ * whether the texels are resident, see msl_nir_lower_sparse */
+#define MSL_TEX_FLAG_SPARSE_RESIDENCY (1u << 7)
+bool msl_nir_lower_sparse(nir_shader *nir);
 
 static const nir_shader_compiler_options kk_nir_options = {
    .lower_fdph = true,

@@ -302,6 +302,7 @@ kk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
    msl_preprocess_nir(nir);
+   NIR_PASS(_, nir, msl_nir_lower_sparse);
 
    /* Cannot be part of msl_preprocess_nir since clc does not expose
     * has_base_workgroup_id. Only vkCmdDispatchBase has a base, and the root

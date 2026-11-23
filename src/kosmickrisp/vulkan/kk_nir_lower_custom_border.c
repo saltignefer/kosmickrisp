@@ -12,6 +12,8 @@
 
 #include "kk_shader.h"
 
+#include "kosmickrisp/compiler/nir_to_msl.h"
+
 #include "nir.h"
 #include "nir_builder.h"
 #include "nir_builtin_builder.h"
@@ -36,6 +38,10 @@ static bool
 lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
 {
    if (!nir_tex_instr_need_sampler(tex) || nir_tex_instr_is_query(tex))
+      return false;
+
+   /* Residency is not a color, see msl_nir_lower_sparse */
+   if (tex->backend_flags & MSL_TEX_FLAG_SPARSE_RESIDENCY)
       return false;
 
    /* XXX: this is a really weird edge case, is this even well-defined? */

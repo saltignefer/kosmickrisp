@@ -1403,3 +1403,136 @@ msl_nir_lower_fp64(nir_shader *nir)
    return progress;
 }
 
+static nir_intrinsic_op
+sparse_load_to_load(nir_intrinsic_op op)
+{
+   switch (op) {
+   case nir_intrinsic_image_deref_sparse_load:
+      return nir_intrinsic_image_deref_load;
+   case nir_intrinsic_image_sparse_load:
+      return nir_intrinsic_image_load;
+   case nir_intrinsic_bindless_image_sparse_load:
+      return nir_intrinsic_bindless_image_load;
+   default:
+      return nir_num_intrinsics;
+   }
+}
+
+static bool
+lower_sparse_instr(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   b->cursor = nir_before_instr(instr);
+
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      if (!tex->is_sparse)
+         return false;
+
+      unsigned n = nir_tex_instr_result_size(tex);
+
+      nir_tex_instr *value =
+         nir_instr_as_tex(nir_instr_clone(b->shader, instr));
+      value->is_sparse = false;
+      value->def.num_components = n;
+      nir_builder_instr_insert(b, &value->instr);
+
+      /* The result type must match the sampler type, so float textures
+       * return 1.0 for resident texels */
+      nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+      /* Gathers with four offsets are split into four gathers later, so ask
+       * for the residency of each offset now. Each covers the whole 2x2
+       * footprint of its offset, so this may report texels the gather does
+       * not return as non-resident. */
+      bool offsets = tex->op == nir_texop_tg4 &&
+                     nir_tex_instr_has_explicit_tg4_offsets(tex);
+      nir_def *code = NULL;
+      for (unsigned i = 0; i < (offsets ? 4 : 1); i++) {
+         nir_tex_instr *res =
+            nir_instr_as_tex(nir_instr_clone(b->shader, instr));
+         res->is_sparse = false;
+         res->backend_flags |= MSL_TEX_FLAG_SPARSE_RESIDENCY;
+         res->dest_type = base | 32;
+         res->def.num_components = n;
+         res->def.bit_size = 32;
+         if (offsets) {
+            memset(res->tg4_offsets, 0, sizeof(res->tg4_offsets));
+            nir_tex_instr_add_src(res, nir_tex_src_offset,
+                                  nir_imm_ivec2(b, tex->tg4_offsets[i][0],
+                                                tex->tg4_offsets[i][1]));
+         }
+         nir_builder_instr_insert(b, &res->instr);
+
+         nir_def *res_code = nir_channel(b, &res->def, 0);
+         if (base == nir_type_float)
+            res_code = nir_f2u32(b, res_code);
+         code = code ? nir_iand(b, code, res_code) : res_code;
+      }
+
+      nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned i = 0; i < n; i++)
+         comps[i] = nir_channel(b, &value->def, i);
+      comps[n] = nir_u2uN(b, code, tex->def.bit_size);
+      nir_def_replace(&tex->def, nir_vec(b, comps, n + 1));
+      return true;
+   }
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_is_sparse_texels_resident:
+      nir_def_replace(&intr->def, nir_ine_imm(b, intr->src[0].ssa, 0));
+      return true;
+   case nir_intrinsic_sparse_residency_code_and:
+      nir_def_replace(&intr->def,
+                      nir_iand(b, intr->src[0].ssa, intr->src[1].ssa));
+      return true;
+   default:
+      break;
+   }
+
+   nir_intrinsic_op load_op = sparse_load_to_load(intr->intrinsic);
+   if (load_op == nir_num_intrinsics || intr->def.num_components == 1)
+      return false;
+
+   unsigned n = intr->def.num_components - 1;
+
+   nir_intrinsic_instr *value =
+      nir_instr_as_intrinsic(nir_instr_clone(b->shader, instr));
+   value->intrinsic = load_op;
+   value->num_components = n;
+   value->def.num_components = n;
+   nir_builder_instr_insert(b, &value->instr);
+
+   /* A one component uint32 sparse load is only the residency code, which
+    * the driver looks up */
+   nir_intrinsic_instr *res =
+      nir_instr_as_intrinsic(nir_instr_clone(b->shader, instr));
+   res->num_components = 1;
+   res->def.num_components = 1;
+   res->def.bit_size = 32;
+   nir_intrinsic_set_dest_type(res, nir_type_uint32);
+   nir_builder_instr_insert(b, &res->instr);
+
+   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < n; i++)
+      comps[i] = nir_channel(b, &value->def, i);
+   comps[n] = nir_u2uN(b, &res->def, intr->def.bit_size);
+   nir_def_replace(&intr->def, nir_vec(b, comps, n + 1));
+   return true;
+}
+
+/* Metal returns the texel and its residency from one sparse operation, but
+ * NIR packs the residency code into an extra component, which MSL vectors
+ * cannot hold. Split sparse operations into a regular one for the value and
+ * one that only returns the residency code, 1 when resident: a texture
+ * operation flagged with MSL_TEX_FLAG_SPARSE_RESIDENCY, which the Metal
+ * compiler merges with the other one again, or a one component image load,
+ * which the driver lowers. */
+bool
+msl_nir_lower_sparse(nir_shader *nir)
+{
+   return nir_shader_instructions_pass(nir, lower_sparse_instr,
+                                       nir_metadata_control_flow, NULL);
+}
