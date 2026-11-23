@@ -53,8 +53,11 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
             "Allocation could potentially trigger a known kernel panic");
    }
 
+   /* Any allocation may back a sparse resource, but only pay for the sparse
+    * page rounding when the application asked for sparse binding. */
    mtl_heap *handle =
-      mtl_new_heap(dev->mtl_handle, size_B, KK_MTL_RESOURCE_OPTIONS);
+      mtl_new_heap(dev->mtl_handle, size_B, KK_MTL_RESOURCE_OPTIONS,
+                   dev->vk.enabled_features.sparseBinding);
    if (handle == NULL) {
       result = vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
       goto fail_heap;

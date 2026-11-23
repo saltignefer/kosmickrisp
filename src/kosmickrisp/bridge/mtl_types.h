@@ -10,7 +10,9 @@
 #ifndef KK_MTL_TYPES_H
 #define KK_MTL_TYPES_H 1
 
+#include <stdbool.h>
 #include <stddef.h> /* For size_t definition */
+#include <stdint.h>
 
 /** HANDLES */
 typedef void mtl_device;
@@ -387,6 +389,28 @@ struct mtl_texture_memory_copy {
    size_t buffer_2d_image_size_B;
    size_t image_slice;
    size_t image_level;
+};
+
+/* Page size of every placement sparse resource, and the largest one the heaps
+ * backing device memory are compatible with. */
+#define MTL_SPARSE_PAGE_SIZE_B (64u * 1024u)
+
+/* MTL4UpdateSparseBufferMappingOperation, in units of sparse pages */
+struct mtl_sparse_buffer_mapping {
+   uint64_t buffer_page;
+   uint64_t page_count;
+   uint64_t heap_page; /* Ignored when unmapping */
+   bool map;
+};
+
+/* MTL4UpdateSparseTextureMappingOperation, region in units of sparse tiles */
+struct mtl_sparse_texture_mapping {
+   struct mtl_origin origin;
+   struct mtl_size size;
+   uint32_t level;
+   uint32_t slice;
+   uint64_t heap_page; /* Ignored when unmapping */
+   bool map;
 };
 
 struct mtl_feedback_data {

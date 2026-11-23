@@ -255,6 +255,9 @@ kk_get_device_features(
       .shaderInt16 = true,
       .shaderInt64 = true,
       .shaderResourceMinLod = true,
+      .sparseBinding = info->supports_sparse,
+      .sparseResidencyBuffer = info->supports_sparse,
+      .sparseResidencyAliased = info->supports_sparse,
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
@@ -677,6 +680,8 @@ kk_get_device_properties(
       .nonCoherentAtomSize = 64,
 
       /* Vulkan 1.0 sparse properties */
+      /* Unbound pages read as zero and drop writes, but a shader reading
+       * back its own write to an unbound page sees the written value. */
       .sparseResidencyNonResidentStrict = false,
       .sparseResidencyAlignedMipSize = false,
       .sparseResidencyStandard2DBlockShape = false,
@@ -1111,6 +1116,9 @@ get_metal_limits(struct kk_physical_device *pdev)
       mtl_device_supports_32_bit_float_filtering(pdev->mtl_dev_handle);
    pdev->info.gpu_apple_family =
       mtl_device_get_gpu_apple_family(pdev->mtl_dev_handle);
+   pdev->info.supports_sparse =
+      KK_EXPERIMENTAL(SPARSE) && pdev->info.gpu_apple_family >= 9 &&
+      mtl_device_supports_placement_sparse(pdev->mtl_dev_handle);
 
    /* Determine the supported MSL version based on the OS. The version used to
     * compile determines what features are available. */
@@ -1273,7 +1281,8 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
 
    pdev->queue_families[pdev->queue_family_count++] = (struct kk_queue_family){
       .queue_flags =
-         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
+         (pdev->info.supports_sparse ? VK_QUEUE_SPARSE_BINDING_BIT : 0),
       .queue_count = 1,
    };
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));

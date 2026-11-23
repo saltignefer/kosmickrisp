@@ -31,6 +31,13 @@ struct kk_queue {
    uint32_t commits_in_flight;
    mtx_t mutex;
    cnd_t cond;
+
+   /* Metal keeps translating unmapped placement sparse pages until a later
+    * map operation. Binds that unmap end by mapping this page. */
+   struct {
+      mtl_heap *heap;
+      mtl_buffer *buffer;
+   } sparse_flush;
 };
 
 static inline struct kk_device *

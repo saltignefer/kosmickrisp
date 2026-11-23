@@ -15,8 +15,11 @@
 struct kk_image_layout;
 
 /* Creation */
+/* sparse_compatible heaps can back MTL_SPARSE_PAGE_SIZE_B placement sparse
+ * resources, at the cost of rounding their size to that page size. */
 mtl_heap *mtl_new_heap(mtl_device *device, uint64_t size,
-                       enum mtl_resource_options resource_options);
+                       enum mtl_resource_options resource_options,
+                       bool sparse_compatible);
 
 /* Utils */
 uint64_t mtl_heap_get_size(mtl_heap *heap);

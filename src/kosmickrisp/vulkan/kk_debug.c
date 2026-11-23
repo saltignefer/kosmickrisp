@@ -24,6 +24,7 @@ const struct debug_named_value experimental_flags[] = {
    {"image_view_min_lod", KK_EXPERIMENTAL_IMAGE_VIEW_MIN_LOD},
    {"optimize_e5b9g9r9", KK_EXPERIMENTAL_OPTIMIZE_E5B9G9R9},
    {"mesh_shader", KK_EXPERIMENTAL_MESH_SHADER},
+   {"sparse", KK_EXPERIMENTAL_SPARSE},
    {NULL, 0},
 };
 

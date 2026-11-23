@@ -11,6 +11,7 @@
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
+#include "kk_sparse.h"
 #include "kk_sync.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
@@ -194,6 +195,8 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * Otherwise, users are playing with fire. */
    kk_device_make_resources_resident(dev);
 
+   kk_queue_bind_sparse(queue, submit);
+
    for (uint32_t i = 0; i < submit->command_buffer_count; ++i) {
       struct kk_cmd_buffer *cmd_buffer =
          container_of(submit->command_buffers[i], struct kk_cmd_buffer, vk);
@@ -290,6 +293,12 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
    mtl_command_queue_add_residency_set(queue->mtl_handle,
                                        dev->residency_set.handle);
 
+   result = kk_queue_sparse_init(queue);
+   if (result != VK_SUCCESS) {
+      kk_queue_finish(dev, queue);
+      return result;
+   }
+
    queue->vk.driver_submit = kk_queue_submit;
 
    return VK_SUCCESS;
@@ -300,6 +309,8 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
 {
    /* There may be in-flight command buffers, wait for them to finish. */
    kk_queue_wait_for_commits(queue);
+
+   kk_queue_sparse_finish(queue);
 
    mtl_command_queue_remove_residency_set(queue->mtl_handle,
                                           dev->residency_set.handle);

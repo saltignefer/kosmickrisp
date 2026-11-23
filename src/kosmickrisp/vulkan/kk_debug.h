@@ -28,6 +28,8 @@ enum kk_experimental {
    KK_EXPERIMENTAL_OPTIMIZE_E5B9G9R9 = 1ull << 2,
    /* Advertise VK_EXT_mesh_shader, work in progress */
    KK_EXPERIMENTAL_MESH_SHADER = 1ull << 3,
+   /* Advertise sparse binding and residency on M3 and later */
+   KK_EXPERIMENTAL_SPARSE = 1ull << 4,
 };
 
 extern enum kk_experimental kk_mesa_experimental_flags;

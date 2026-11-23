@@ -46,6 +46,21 @@ kk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
    if (!buffer)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   /* Sparse buffers own their Metal buffer, whose pages vkQueueBindSparse maps
+    * onto device memory heaps. Metal requires the buffer itself to be resident
+    * for mapped pages to be accessible. */
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
+      buffer->metal.handle = mtl_new_placement_sparse_buffer(
+         dev->mtl_handle, align64(buffer->vk.size, MTL_SPARSE_PAGE_SIZE_B));
+      if (!buffer->metal.handle) {
+         vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      kk_device_add_buffer_to_residency_set(dev, buffer->metal.handle);
+      buffer->vk.device_address =
+         mtl_buffer_get_gpu_address(buffer->metal.handle);
+   }
+
    *pBuffer = kk_buffer_to_handle(buffer);
 
    return VK_SUCCESS;
@@ -61,6 +76,9 @@ kk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
    if (!buffer)
       return;
 
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+      kk_device_remove_buffer_from_residency_set(dev, buffer->metal.handle);
+
    if (buffer->metal.handle)
       mtl_release(buffer->metal.handle);
 
@@ -75,9 +93,12 @@ kk_GetDeviceBufferMemoryRequirements(
    VK_FROM_HANDLE(kk_device, dev, device);
    struct kk_physical_device *pdev = kk_device_physical(dev);
 
-   const uint64_t alignment = kk_get_buffer_alignment(
-      pdev, pInfo->pCreateInfo->size, pInfo->pCreateInfo->usage,
-      pInfo->pCreateInfo->flags);
+   const uint64_t alignment =
+      (pInfo->pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+         ? MTL_SPARSE_PAGE_SIZE_B
+         : kk_get_buffer_alignment(pdev, pInfo->pCreateInfo->size,
+                                   pInfo->pCreateInfo->usage,
+                                   pInfo->pCreateInfo->flags);
 
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
       .size = align64(pInfo->pCreateInfo->size, alignment),

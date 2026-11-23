@@ -38,3 +38,9 @@ mtl_texture_replace_region(mtl_texture *texture, const void *host_ptr,
                            struct mtl_texture_memory_copy *data)
 {
 }
+
+uint64_t
+mtl_texture_tail_size_in_bytes(mtl_texture *texture)
+{
+   return 0u;
+}

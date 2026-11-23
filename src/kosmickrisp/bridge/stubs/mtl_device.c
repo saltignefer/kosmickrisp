@@ -180,3 +180,29 @@ mtl_new_command_buffer(mtl_device *device)
 {
    return NULL;
 }
+
+bool
+mtl_device_supports_placement_sparse(mtl_device *dev)
+{
+   return false;
+}
+
+struct mtl_size
+mtl_placement_sparse_tile_size(mtl_device *device,
+                               struct kk_image_layout *layout)
+{
+   return (struct mtl_size){1, 1, 1};
+}
+
+mtl_buffer *
+mtl_new_placement_sparse_buffer(mtl_device *device, uint64_t size_B)
+{
+   return NULL;
+}
+
+mtl_texture *
+mtl_new_placement_sparse_texture(mtl_device *device,
+                                 const struct kk_image_layout *layout)
+{
+   return NULL;
+}

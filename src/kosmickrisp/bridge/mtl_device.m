@@ -348,6 +348,62 @@ mtl_sparse_tile_count(mtl_device *device, struct kk_image_layout *layout,
    }
 }
 
+bool
+mtl_device_supports_placement_sparse(mtl_device *device)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      if (@available(macOS 26.4, *))
+         return dev.supportsPlacementSparse;
+      return false;
+   }
+}
+
+struct mtl_size
+mtl_placement_sparse_tile_size(mtl_device *device,
+                               struct kk_image_layout *layout)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      MTLSize tile_size =
+         [dev sparseTileSizeWithTextureType:(MTLTextureType)layout->type
+                                pixelFormat:layout->format.mtl
+                                sampleCount:layout->sample_count_sa
+                             sparsePageSize:MTLSparsePageSize64];
+      return (struct mtl_size){tile_size.width, tile_size.height,
+                               tile_size.depth};
+   }
+}
+
+/* Metal rejects shared storage for placement sparse resources */
+#define KK_MTL_SPARSE_RESOURCE_OPTIONS                                         \
+   (MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked)
+
+mtl_buffer *
+mtl_new_placement_sparse_buffer(mtl_device *device, uint64_t size_B)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      return [dev newBufferWithLength:size_B
+                              options:KK_MTL_SPARSE_RESOURCE_OPTIONS
+              placementSparsePageSize:MTLSparsePageSize64];
+   }
+}
+
+mtl_texture *
+mtl_new_placement_sparse_texture(mtl_device *device,
+                                 const struct kk_image_layout *layout)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      MTLTextureDescriptor *descriptor =
+         [mtl_new_texture_descriptor(layout) autorelease];
+      descriptor.resourceOptions = KK_MTL_SPARSE_RESOURCE_OPTIONS;
+      descriptor.placementSparsePageSize = MTLSparsePageSize64;
+      return [dev newTextureWithDescriptor:descriptor];
+   }
+}
+
 /* Resource creation */
 mtl_buffer *
 mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void* ptr,

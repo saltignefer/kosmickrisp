@@ -104,6 +104,8 @@ kk_files = files(
   'kk_query_table.c',
   'kk_queue.h',
   'kk_queue.c',
+  'kk_sparse.h',
+  'kk_sparse.c',
   'kk_sampler.h',
   'kk_sampler.c',
   'kk_shader.h',
