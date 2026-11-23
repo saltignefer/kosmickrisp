@@ -796,7 +796,12 @@ emit_src_component(struct nir_to_msl_ctx *ctx, nir_src *src, unsigned comp)
       } else if (v == -INFINITY) {
          P(ctx, "(-INFINITY");
       } else if (isnan(v)) {
-         P(ctx, "(NAN");
+         /* NAN is the canonical quiet NaN, so emit the exact bits to keep the
+          * sign and payload. */
+         P(ctx, "as_type<%s>((%s)0x%" PRIx64 "u",
+           src->ssa->bit_size == 16 ? "half" : "float",
+           src->ssa->bit_size == 16 ? "ushort" : "uint",
+           nir_src_comp_as_uint(*src, comp));
       } else {
          /* Building the types explicitly is required since the MSL compiler is
           * too dumb to understand that "max(as_type<int>(t53), -2147483648)" is
