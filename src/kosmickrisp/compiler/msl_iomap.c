@@ -53,6 +53,7 @@ static const char *vector_suffixes[] = {
 /* The type names of the generated output structs */
 static const char *VERTEX_OUTPUT_TYPE = "VertexOut";
 static const char *FRAGMENT_OUTPUT_TYPE = "FragmentOut";
+static const char *MESH_PRIMITIVE_OUTPUT_TYPE = "PrimitiveOut";
 
 /* Mapping from NIR's varying slots to the generated struct member name */
 static const struct {
@@ -108,6 +109,27 @@ static const struct {
    [VARYING_SLOT_VAR30] = {"vary_30", .user = true},
    [VARYING_SLOT_VAR31] = {"vary_31", .user = true},
 };
+
+/* Varyings sharing a slot may mix 16 and 32-bit components after
+ * nir_opt_varyings packed them, but a struct member has a single type. User
+ * varyings are thus always 32-bit in the IO structs, so both stages agree, and
+ * 16-bit accesses convert. */
+nir_alu_type
+msl_varying_member_type(unsigned location, nir_alu_type type)
+{
+   if (VARYING_SLOT_INFO[location].user &&
+       nir_alu_type_get_type_size(type) == 16)
+      return nir_alu_type_get_base_type(type) | 32;
+   return type;
+}
+
+void
+msl_varying_member_type_name(struct nir_to_msl_ctx *ctx, unsigned location,
+                             nir_alu_type type, unsigned num_components)
+{
+   P(ctx, "%s%s", alu_type_to_string(msl_varying_member_type(location, type)),
+     vector_suffixes[num_components]);
+}
 
 static void
 varying_slot_name(struct nir_to_msl_ctx *ctx, unsigned location,
@@ -176,7 +198,8 @@ vs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
    u_foreach_bit64(location, shader->info.outputs_written) {
       struct io_slot_info info = ctx->outputs_info[location];
       bool scalarized = VARYING_SLOT_INFO[location].scalarized;
-      const char *type = alu_type_to_string(info.type);
+      const char *type =
+         alu_type_to_string(msl_varying_member_type(location, info.type));
       const char *vector_suffix =
          scalarized ? "" : vector_suffixes[info.num_components];
       unsigned components = scalarized ? info.num_components : 1;
@@ -197,11 +220,130 @@ vs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
 }
 
 static void
+mesh_output_member(struct nir_to_msl_ctx *ctx, unsigned location)
+{
+   struct io_slot_info info = ctx->outputs_info[location];
+   bool scalarized = VARYING_SLOT_INFO[location].scalarized;
+   const char *type =
+      alu_type_to_string(msl_varying_member_type(location, info.type));
+   const char *vector_suffix =
+      scalarized ? "" : vector_suffixes[info.num_components];
+   unsigned components = scalarized ? info.num_components : 1;
+   for (int c = 0; c < components; c++) {
+      P_IND(ctx, "%s%s ", type, vector_suffix);
+      varying_slot_name(ctx, location, c);
+      P(ctx, " ");
+      varying_slot_semantic(ctx, location, c);
+      P(ctx, ";\n");
+   }
+}
+
+/* Mesh outputs are written into threadgroup copies of these structs and handed
+ * to the Metal mesh object at the end of the shader. The fragment shader
+ * matches its inputs against both structs by their user() names. */
+static void
+mesh_output_blocks(nir_shader *shader, struct nir_to_msl_ctx *ctx)
+{
+   P(ctx, "struct %s {\n", VERTEX_OUTPUT_TYPE);
+   ctx->indentlevel++;
+   /* Metal requires a position output even if the shader writes none, and a
+    * point size with the point topology */
+   if (!(msl_mesh_vertex_outputs(shader) & VARYING_BIT_POS))
+      P_IND(ctx, "float4 position [[position]];\n");
+   if (msl_mesh_needs_default_point_size(shader))
+      P_IND(ctx, "float point_size [[point_size]];\n");
+   u_foreach_bit64(location, msl_mesh_vertex_outputs(shader))
+      mesh_output_member(ctx, location);
+   if (shader->info.clip_distance_array_size)
+      P_IND(ctx, "float gl_ClipDistance [[clip_distance]] [%d];\n",
+            shader->info.clip_distance_array_size);
+   ctx->indentlevel--;
+   P(ctx, "};\n");
+
+   uint64_t prim_outputs = msl_mesh_primitive_outputs(shader);
+   if (prim_outputs) {
+      P(ctx, "struct %s {\n", MESH_PRIMITIVE_OUTPUT_TYPE);
+      ctx->indentlevel++;
+      u_foreach_bit64(location, prim_outputs) {
+         if (location == VARYING_SLOT_CULL_PRIMITIVE) {
+            P_IND(ctx, "bool cull_primitive [[primitive_culled]];\n");
+         } else {
+            mesh_output_member(ctx, location);
+         }
+      }
+      ctx->indentlevel--;
+      P(ctx, "};\n");
+   }
+
+   static const char *topology[] = {
+      [MESA_PRIM_POINTS] = "point",
+      [MESA_PRIM_LINES] = "line",
+      [MESA_PRIM_TRIANGLES] = "triangle",
+   };
+   assert(shader->info.mesh.primitive_type < ARRAY_SIZE(topology) &&
+          topology[shader->info.mesh.primitive_type]);
+   P(ctx, "using kk_mesh_t = metal::mesh<%s, %s, %u, %u, topology::%s>;\n",
+     VERTEX_OUTPUT_TYPE, prim_outputs ? MESH_PRIMITIVE_OUTPUT_TYPE : "void",
+     MAX2(shader->info.mesh.max_vertices_out, 1u),
+     MAX2(shader->info.mesh.max_primitives_out, 1u),
+     topology[shader->info.mesh.primitive_type]);
+}
+
+/* Per-vertex outputs in the vertex struct as members of their own. Clip
+ * distances go to the gl_ClipDistance array, cull distances to their own
+ * threadgroup array. */
+uint64_t
+msl_mesh_vertex_outputs(const nir_shader *shader)
+{
+   return shader->info.outputs_written & ~shader->info.per_primitive_outputs &
+          ~(VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1 |
+            VARYING_BIT_CULL_DIST0 | VARYING_BIT_CULL_DIST1);
+}
+
+/* Per-primitive outputs in the primitive struct. Cull distances cull
+ * primitives through the culled member as well. */
+uint64_t
+msl_mesh_primitive_outputs(const nir_shader *shader)
+{
+   uint64_t outputs =
+      shader->info.outputs_written & shader->info.per_primitive_outputs &
+      ~(VARYING_BIT_PRIMITIVE_INDICES | VARYING_BIT_PRIMITIVE_COUNT);
+   if (shader->info.cull_distance_array_size)
+      outputs |= VARYING_BIT_CULL_PRIMITIVE;
+   return outputs;
+}
+
+bool
+msl_mesh_needs_default_point_size(const nir_shader *shader)
+{
+   return shader->info.mesh.primitive_type == MESA_PRIM_POINTS &&
+          !(msl_mesh_vertex_outputs(shader) & VARYING_BIT_PSIZ);
+}
+
+unsigned
+msl_mesh_indices_per_primitive(const nir_shader *shader)
+{
+   return mesa_vertices_per_prim(shader->info.mesh.primitive_type);
+}
+
+void
+msl_mesh_output_name(struct nir_to_msl_ctx *ctx, unsigned location,
+                     unsigned component)
+{
+   if (location == VARYING_SLOT_CULL_PRIMITIVE) {
+      P(ctx, "cull_primitive");
+   } else {
+      varying_slot_name(ctx, location, component);
+   }
+}
+
+static void
 fs_input_interpolant(struct nir_to_msl_ctx *ctx, uint64_t location)
 {
    struct io_slot_info info = ctx->inputs_info[location];
    bool scalarized = VARYING_SLOT_INFO[location].scalarized;
-   const char *type = alu_type_to_string(info.type);
+   const char *type =
+      alu_type_to_string(msl_varying_member_type(location, info.type));
    const char *vector_suffix =
       scalarized ? "" : vector_suffixes[info.num_components];
    unsigned components = scalarized ? info.num_components : 1;
@@ -230,7 +372,8 @@ fs_input_no_interpolant(struct nir_to_msl_ctx *ctx, uint64_t location)
 {
    struct io_slot_info info = ctx->inputs_info[location];
    bool scalarized = VARYING_SLOT_INFO[location].scalarized;
-   const char *type = alu_type_to_string(info.type);
+   const char *type =
+      alu_type_to_string(msl_varying_member_type(location, info.type));
    const char *vector_suffix =
       scalarized ? "" : vector_suffixes[info.num_components];
    unsigned components = scalarized ? info.num_components : 1;
@@ -325,6 +468,12 @@ static bool
 msl_nir_gather_io_info(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
    struct gather_ctx *ctx = (struct gather_ctx *)data;
+
+   /* Slots of the IO structs hold whole components */
+   assert(!(nir_intrinsic_has_io_semantics(intrin) &&
+            nir_intrinsic_io_semantics(intrin).high_16bits) &&
+          "16-bit halves of a component are not supported");
+
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_interpolated_input: {
       unsigned component = nir_intrinsic_component(intrin);
@@ -352,7 +501,8 @@ msl_nir_gather_io_info(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
          interp_intrin->intrinsic == nir_intrinsic_load_barycentric_at_offset;
       break;
    }
-   case nir_intrinsic_load_input: {
+   case nir_intrinsic_load_input:
+   case nir_intrinsic_load_per_primitive_input: {
       unsigned component = nir_intrinsic_component(intrin);
       struct nir_io_semantics io = nir_intrinsic_io_semantics(intrin);
       assert(io.num_slots == 1u && "We don't support arrays");
@@ -367,12 +517,22 @@ msl_nir_gather_io_info(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
              "Cannot have more than a vec4");
       break;
    }
-   case nir_intrinsic_load_output: {
+   case nir_intrinsic_load_output:
+   case nir_intrinsic_load_per_vertex_output:
+   case nir_intrinsic_load_per_primitive_output: {
       unsigned component = nir_intrinsic_component(intrin);
       struct nir_io_semantics io = nir_intrinsic_io_semantics(intrin);
-      assert(io.num_slots == 1u && "We don't support arrays");
+      /* Mesh primitive indices are not part of the output structs */
+      if (io.location == VARYING_SLOT_PRIMITIVE_INDICES)
+         break;
+      /* Mesh output arrays are not split, their slots are addressed by a
+       * constant offset */
+      assert(
+         (io.num_slots == 1u || b->shader->info.stage == MESA_SHADER_MESH) &&
+         "We don't support arrays");
 
-      unsigned location = nir_src_as_uint(intrin->src[0u]) + io.location;
+      unsigned location =
+         nir_src_as_uint(*nir_get_io_offset_src(intrin)) + io.location;
       ctx->output[location].type = nir_intrinsic_dest_type(intrin);
       ctx->output[location].num_components =
          MAX2(ctx->output[location].num_components,
@@ -381,11 +541,19 @@ msl_nir_gather_io_info(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
              "Cannot have more than a vec4");
       break;
    }
-   case nir_intrinsic_store_output: {
+   case nir_intrinsic_store_output:
+   case nir_intrinsic_store_per_vertex_output:
+   case nir_intrinsic_store_per_primitive_output: {
       unsigned component = nir_intrinsic_component(intrin);
       unsigned write_mask = nir_intrinsic_write_mask(intrin);
       struct nir_io_semantics io = nir_intrinsic_io_semantics(intrin);
-      assert(io.num_slots == 1u && "We don't support arrays");
+      if (io.location == VARYING_SLOT_PRIMITIVE_INDICES)
+         break;
+      /* Mesh output arrays are not split, their slots are addressed by a
+       * constant offset */
+      assert(
+         (io.num_slots == 1u || b->shader->info.stage == MESA_SHADER_MESH) &&
+         "We don't support arrays");
 
       /* Due to nir_lower_blend that doesn't generate intrinsics with the same
        * num_components as destination, we need to compute current store's
@@ -397,7 +565,8 @@ msl_nir_gather_io_info(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
             mask_left_most_index = i;
       }
       num_components += mask_left_most_index;
-      unsigned location = nir_src_as_uint(intrin->src[1u]) + io.location;
+      unsigned location =
+         nir_src_as_uint(*nir_get_io_offset_src(intrin)) + io.location;
       ctx->output[location].type = nir_intrinsic_src_type(intrin);
       ctx->output[location].num_components =
          MAX3(ctx->output[location].num_components, num_components,
@@ -438,6 +607,10 @@ msl_emit_io_blocks(struct nir_to_msl_ctx *ctx, nir_shader *shader)
       fs_input_block(shader, ctx);
       fs_output_block(shader, ctx);
       break;
+   case MESA_SHADER_MESH:
+      mesh_output_blocks(shader, ctx);
+      break;
+   case MESA_SHADER_TASK:
    case MESA_SHADER_COMPUTE:
    case MESA_SHADER_TESS_CTRL:
       break;
@@ -478,6 +651,30 @@ msl_emit_output_var(struct nir_to_msl_ctx *ctx, nir_shader *shader)
                FS_OUTPUT_NAME[location]);
       }
       break;
+   case MESA_SHADER_MESH: {
+      /* Vulkan mesh outputs are written per field and may be read back, Metal
+       * only takes whole vertices and primitives. Stage them in threadgroup
+       * memory. The counts of the first invocation apply. */
+      unsigned max_vertices = MAX2(shader->info.mesh.max_vertices_out, 1u);
+      unsigned max_primitives = MAX2(shader->info.mesh.max_primitives_out, 1u);
+      P_IND(ctx, "threadgroup %s kk_mesh_verts[%u];\n", VERTEX_OUTPUT_TYPE,
+            max_vertices);
+      if (msl_mesh_primitive_outputs(shader))
+         P_IND(ctx, "threadgroup %s kk_mesh_prims[%u];\n",
+               MESH_PRIMITIVE_OUTPUT_TYPE, max_primitives);
+      P_IND(ctx, "threadgroup uchar kk_mesh_indices[%u];\n",
+            max_primitives * msl_mesh_indices_per_primitive(shader));
+      if (shader->info.cull_distance_array_size)
+         P_IND(ctx, "threadgroup float kk_mesh_cull_distances[%u][%u];\n",
+               max_vertices, shader->info.cull_distance_array_size);
+      P_IND(ctx, "threadgroup uint kk_mesh_vertex_count;\n");
+      P_IND(ctx, "threadgroup uint kk_mesh_primitive_count;\n");
+      P_IND(ctx, "if (gl_LocalInvocationIndex == 0u) {\n");
+      P_IND(ctx, "    kk_mesh_vertex_count = 0u;\n");
+      P_IND(ctx, "    kk_mesh_primitive_count = 0u;\n");
+      P_IND(ctx, "}\n");
+      break;
+   }
    default:
       break;
    }
@@ -531,7 +728,8 @@ msl_input_num_components(struct nir_to_msl_ctx *ctx, uint32_t location)
 uint32_t
 msl_output_num_components(struct nir_to_msl_ctx *ctx, uint32_t location)
 {
-   if (ctx->shader->info.stage == MESA_SHADER_VERTEX &&
+   if ((ctx->shader->info.stage == MESA_SHADER_VERTEX ||
+        ctx->shader->info.stage == MESA_SHADER_MESH) &&
        VARYING_SLOT_INFO[location].scalarized)
       return 1;
    else

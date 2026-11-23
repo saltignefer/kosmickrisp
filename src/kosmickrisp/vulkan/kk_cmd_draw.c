@@ -834,12 +834,28 @@ kk_calculate_vbo_clamp(uint64_t vbuf, uint64_t sink, enum pipe_format format,
 }
 
 /* The GS output primitive if one is bound, otherwise the input topology */
+/* The first bound graphics stage holds the Metal pipeline */
+static struct kk_shader *
+kk_gfx_pipeline_shader(struct kk_cmd_buffer *cmd)
+{
+   struct kk_shader **shaders = cmd->state.shaders;
+   if (shaders[MESA_SHADER_VERTEX])
+      return shaders[MESA_SHADER_VERTEX];
+   if (shaders[MESA_SHADER_TASK])
+      return shaders[MESA_SHADER_TASK];
+   return shaders[MESA_SHADER_MESH];
+}
+
 static enum mesa_prim
 kk_rast_prim(struct kk_cmd_buffer *cmd)
 {
    struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
    if (gs)
       return gs->info.gs.mode;
+
+   struct kk_shader *ms = cmd->state.shaders[MESA_SHADER_MESH];
+   if (ms)
+      return ms->info.mesh.primitive_type;
 
    return vk_topology_to_mesa(
       cmd->vk.dynamic_graphics_state.ia.primitive_topology);
@@ -997,9 +1013,11 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
       mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
 
-   if (IS_SHADER_DIRTY(VERTEX)) {
-      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
-      mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
+   struct kk_shader *pipeline_shader = kk_gfx_pipeline_shader(cmd);
+   if ((IS_SHADER_DIRTY(VERTEX) || IS_SHADER_DIRTY(TASK) ||
+        IS_SHADER_DIRTY(MESH)) &&
+       pipeline_shader) {
+      mtl_render_set_pipeline_state(enc, pipeline_shader->pipeline.gfx.render);
       if (gfx->depth_stencil_state)
          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
@@ -1106,7 +1124,9 @@ struct kk_draw_command {
    bool indexed;
    bool restart;
    bool flatshade_first;
-   uint8_t pad_[3];
+   /* Task or mesh draw, draws are VkDrawMeshTasksIndirectCommandEXT */
+   bool mesh;
+   uint8_t pad_[2];
    uint32_t predicate_count;
    enum kk_predicate_op predicate_op[2];
    uint32_t draw_count;
@@ -1121,6 +1141,7 @@ struct kk_draw_command {
        * dynamically allocated. */
       VkDrawIndirectCommand draws[1];
       VkDrawIndexedIndirectCommand indexed_draws[1];
+      VkDrawMeshTasksIndirectCommandEXT mesh_draws[1];
    };
 };
 static_assert(sizeof(struct kk_draw_command) == 88u, "Packed struct");
@@ -1362,7 +1383,7 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    }
 
    if (IS_DIRTY(RS_CULL_MODE) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
-       IS_SHADER_DIRTY(GEOMETRY)) {
+       IS_SHADER_DIRTY(GEOMETRY) || IS_SHADER_DIRTY(MESH)) {
       /* Only disable rendering if primitive type is culled. */
       gfx->is_cull_front_and_back =
          dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK &&
@@ -1484,9 +1505,9 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
       desc->root_dirty = true;
    }
 
-   if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
-       IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB) {
-      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   if (vs && (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
+              IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB)) {
       unsigned slot = 0;
       u_foreach_bit(i, vs->info.vs.attribs_read) {
          if (dyn->vi->attributes_valid & BITFIELD_BIT(i)) {
@@ -1539,6 +1560,15 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
 #undef IS_SHADER_DIRTY
 #undef IS_DIRTY
 
+static uint32_t
+kk_draw_command_stride(const struct kk_draw_command *data)
+{
+   if (data->mesh)
+      return sizeof(VkDrawMeshTasksIndirectCommandEXT);
+   return data->indexed ? sizeof(VkDrawIndexedIndirectCommand)
+                        : sizeof(VkDrawIndirectCommand);
+}
+
 /* Returns true if the draw was successfully converted. */
 static bool
 kk_convert_to_indirect_draw(struct kk_cmd_buffer *cmd,
@@ -1547,8 +1577,7 @@ kk_convert_to_indirect_draw(struct kk_cmd_buffer *cmd,
    if (data->indirect)
       return true;
 
-   uint32_t draw_stride = data->indexed ? sizeof(VkDrawIndexedIndirectCommand)
-                                        : sizeof(VkDrawIndirectCommand);
+   uint32_t draw_stride = kk_draw_command_stride(data);
    struct kk_ptr indirect_draw =
       kk_pool_upload(cmd, &data->draws[0], data->draw_count * draw_stride, 4u);
 
@@ -1574,8 +1603,7 @@ kk_predicate_draws(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    assert((data->indirect_command.stride % sizeof(uint32_t)) == 0 &&
           "stride is not aligned");
 
-   uint32_t out_stride = data->indexed ? sizeof(VkDrawIndexedIndirectCommand)
-                                       : sizeof(VkDrawIndirectCommand);
+   uint32_t out_stride = kk_draw_command_stride(data);
    struct kk_ptr patched =
       kk_pool_alloc(cmd, out_stride * data->draw_count, 4u);
    if (unlikely(!patched.gpu))
@@ -2709,4 +2737,147 @@ kk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
    };
 
    kk_draw(cmd, &data);
+}
+
+static void
+kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+{
+   assert(data->mesh);
+   kk_flush_gfx_state(cmd);
+
+   /* Count buffers and conditional rendering zero out disabled draws */
+   if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
+      return;
+
+   /* The predicates run as compute and may have ended the render pass */
+   if (cmd->state.gfx.need_to_start_render_pass)
+      kk_flush_gfx_state(cmd);
+
+   struct kk_shader *pipeline_shader = kk_gfx_pipeline_shader(cmd);
+   assert(pipeline_shader && pipeline_shader->info.holds_pipeline);
+   const struct kk_shader_info *info = &pipeline_shader->info;
+
+   uint32_t upload_mask = 0u;
+   u_foreach_bit(stage, BITFIELD_BIT(MESA_SHADER_TASK) |
+                           BITFIELD_BIT(MESA_SHADER_MESH) |
+                           BITFIELD_BIT(MESA_SHADER_FRAGMENT)) {
+      struct kk_shader *shader = cmd->state.shaders[stage];
+      if (shader && shader->info.uses_per_draw_data)
+         upload_mask |= BITFIELD_BIT(stage);
+   }
+
+   struct kk_per_draw_data *per_draw = &cmd->state.gfx.per_draw_data;
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   per_draw->provoking_last =
+      dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+
+   struct mtl_size task_threads = info->mesh.task_local_size;
+   if (task_threads.x == 0)
+      task_threads = (struct mtl_size){1u, 1u, 1u};
+   struct mtl_size mesh_threads = info->mesh.mesh_local_size;
+
+   mtl_render_encoder *enc = cs_get_render(cmd);
+   for (uint32_t i = 0; i < data->draw_count; i++) {
+      if (upload_mask) {
+         struct kk_draw_data draw_data = {};
+         kk_upload_per_draw_data(cmd, upload_mask, i, &draw_data, false);
+      }
+
+      if (data->indirect) {
+         uint64_t addr = data->indirect_command.addr +
+                         (uint64_t)i * data->indirect_command.stride;
+         mtl_draw_mesh_threadgroups_indirect(enc, addr, task_threads,
+                                             mesh_threads);
+      } else {
+         const VkDrawMeshTasksIndirectCommandEXT *draw = &data->mesh_draws[i];
+         struct mtl_size grid = {
+            .x = draw->groupCountX,
+            .y = draw->groupCountY,
+            .z = draw->groupCountZ,
+         };
+         mtl_draw_mesh_threadgroups(enc, grid, task_threads, mesh_threads);
+      }
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t groupCountX,
+                       uint32_t groupCountY, uint32_t groupCountZ)
+{
+   /* Metal validation dislikes empty calls */
+   if (groupCountX == 0 || groupCountY == 0 || groupCountZ == 0)
+      return;
+
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   struct kk_draw_command data = {
+      .mesh = true,
+      .predicate_count = cmd->state.cond_render.enabled ? 1u : 0u,
+      .predicate_op[0] = cmd->state.cond_render.inverted
+                            ? KK_PREDICATE_EQ_ZERO
+                            : KK_PREDICATE_NEQ_ZERO,
+      .draw_count = 1,
+      .predicate_addr[0] = cmd->state.cond_render.address,
+      .mesh_draws[0] =
+         {
+            .groupCountX = groupCountX,
+            .groupCountY = groupCountY,
+            .groupCountZ = groupCountZ,
+         },
+   };
+
+   kk_draw_mesh(cmd, &data);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdDrawMeshTasksIndirect2EXT(VkCommandBuffer commandBuffer,
+                                const VkDrawIndirect2InfoKHR *pInfo)
+{
+   if (pInfo->drawCount == 0)
+      return;
+
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   struct kk_draw_command data = {
+      .mesh = true,
+      .indirect = true,
+      .predicate_count = cmd->state.cond_render.enabled ? 1u : 0u,
+      .predicate_op[0] = cmd->state.cond_render.inverted
+                            ? KK_PREDICATE_EQ_ZERO
+                            : KK_PREDICATE_NEQ_ZERO,
+      .draw_count = pInfo->drawCount,
+      .predicate_addr[0] = cmd->state.cond_render.address,
+      .indirect_command.addr = pInfo->addressRange.address,
+      .indirect_command.stride = pInfo->addressRange.stride,
+   };
+
+   kk_draw_mesh(cmd, &data);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdDrawMeshTasksIndirectCount2EXT(VkCommandBuffer commandBuffer,
+                                     const VkDrawIndirectCount2InfoKHR *pInfo)
+{
+   if (pInfo->maxDrawCount == 0)
+      return;
+
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+
+   struct kk_draw_command data = {
+      .mesh = true,
+      .indirect = true,
+      .predicate_count = cmd->state.cond_render.enabled ? 2u : 1u,
+      .predicate_op[0] = KK_PREDICATE_GT_DRAW_ID,
+      .predicate_op[1] = cmd->state.cond_render.inverted
+                            ? KK_PREDICATE_EQ_ZERO
+                            : KK_PREDICATE_NEQ_ZERO,
+      .draw_count = pInfo->maxDrawCount,
+      .predicate_addr[0] = pInfo->countAddressRange.address,
+      .predicate_addr[1] = cmd->state.cond_render.address,
+      .indirect_command.addr = pInfo->addressRange.address,
+      .indirect_command.stride = pInfo->addressRange.stride,
+   };
+
+   kk_draw_mesh(cmd, &data);
 }

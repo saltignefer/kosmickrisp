@@ -10,6 +10,7 @@
 #include <Metal/MTL4ComputePipeline.h>
 #include <Metal/MTL4LibraryDescriptor.h>
 #include <Metal/MTL4LibraryFunctionDescriptor.h>
+#include <Metal/MTL4MeshRenderPipeline.h>
 #include <Metal/MTL4RenderPipeline.h>
 #include <Metal/MTLDevice.h>
 
@@ -180,6 +181,89 @@ mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(mtl_render_pip
    @autoreleasepool {
       MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
       desc.maxVertexAmplificationCount = count;
+   }
+}
+
+/* Mesh render pipeline descriptor */
+mtl_mesh_render_pipeline_descriptor *
+mtl_new_mesh_render_pipeline_descriptor(void)
+{
+   @autoreleasepool {
+      return [MTL4MeshRenderPipelineDescriptor new];
+   }
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_object_shader(mtl_mesh_render_pipeline_descriptor *descriptor,
+                                                      mtl_function_descriptor *shader)
+{
+   @autoreleasepool {
+      MTL4MeshRenderPipelineDescriptor *desc = (MTL4MeshRenderPipelineDescriptor *)descriptor;
+      desc.objectFunctionDescriptor = (MTL4FunctionDescriptor *)shader;
+   }
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_mesh_shader(mtl_mesh_render_pipeline_descriptor *descriptor,
+                                                    mtl_function_descriptor *shader)
+{
+   @autoreleasepool {
+      MTL4MeshRenderPipelineDescriptor *desc = (MTL4MeshRenderPipelineDescriptor *)descriptor;
+      desc.meshFunctionDescriptor = (MTL4FunctionDescriptor *)shader;
+   }
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_fragment_shader(mtl_mesh_render_pipeline_descriptor *descriptor,
+                                                        mtl_function_descriptor *shader)
+{
+   @autoreleasepool {
+      MTL4MeshRenderPipelineDescriptor *desc = (MTL4MeshRenderPipelineDescriptor *)descriptor;
+      desc.fragmentFunctionDescriptor = (MTL4FunctionDescriptor *)shader;
+   }
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_threads_per_threadgroup(mtl_mesh_render_pipeline_descriptor *descriptor,
+                                                                struct mtl_size object_threads,
+                                                                struct mtl_size mesh_threads)
+{
+   @autoreleasepool {
+      MTL4MeshRenderPipelineDescriptor *desc = (MTL4MeshRenderPipelineDescriptor *)descriptor;
+      if (object_threads.x)
+         desc.requiredThreadsPerObjectThreadgroup = MTLSizeMake(object_threads.x, object_threads.y, object_threads.z);
+      desc.requiredThreadsPerMeshThreadgroup = MTLSizeMake(mesh_threads.x, mesh_threads.y, mesh_threads.z);
+   }
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_payload_length(mtl_mesh_render_pipeline_descriptor *descriptor,
+                                                       uint32_t length)
+{
+   @autoreleasepool {
+      MTL4MeshRenderPipelineDescriptor *desc = (MTL4MeshRenderPipelineDescriptor *)descriptor;
+      desc.payloadMemoryLength = length;
+   }
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_color_attachment_format(mtl_mesh_render_pipeline_descriptor *descriptor,
+                                                                uint8_t index,
+                                                                enum mtl_pixel_format format)
+{
+   @autoreleasepool {
+      MTL4MeshRenderPipelineDescriptor *desc = (MTL4MeshRenderPipelineDescriptor *)descriptor;
+      desc.colorAttachments[index].pixelFormat = (MTLPixelFormat)format;
+   }
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_raster_sample_count(mtl_mesh_render_pipeline_descriptor *descriptor,
+                                                            uint32_t sample_count)
+{
+   @autoreleasepool {
+      MTL4MeshRenderPipelineDescriptor *desc = (MTL4MeshRenderPipelineDescriptor *)descriptor;
+      desc.rasterSampleCount = sample_count;
    }
 }
 

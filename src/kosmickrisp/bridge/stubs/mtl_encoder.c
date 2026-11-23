@@ -223,6 +223,22 @@ mtl_render_set_argument_table(mtl_render_encoder *encoder,
 }
 
 void
+mtl_draw_mesh_threadgroups(mtl_render_encoder *encoder,
+                           struct mtl_size threadgroups,
+                           struct mtl_size object_threads,
+                           struct mtl_size mesh_threads)
+{
+}
+
+void
+mtl_draw_mesh_threadgroups_indirect(mtl_render_encoder *encoder,
+                                    uint64_t indirect_addr,
+                                    struct mtl_size object_threads,
+                                    struct mtl_size mesh_threads)
+{
+}
+
+void
 mtl_draw_primitives(mtl_render_encoder *encoder,
                     enum mtl_primitive_type primitve_type, uint32_t vertexStart,
                     uint32_t vertexCount, uint32_t instanceCount,

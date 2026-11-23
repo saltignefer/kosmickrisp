@@ -92,6 +92,60 @@ mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
 {
 }
 
+/* Mesh render pipeline descriptor */
+mtl_mesh_render_pipeline_descriptor *
+mtl_new_mesh_render_pipeline_descriptor(void)
+{
+   return NULL;
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_object_shader(
+   mtl_mesh_render_pipeline_descriptor *descriptor,
+   mtl_function_descriptor *shader)
+{
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_mesh_shader(
+   mtl_mesh_render_pipeline_descriptor *descriptor,
+   mtl_function_descriptor *shader)
+{
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_fragment_shader(
+   mtl_mesh_render_pipeline_descriptor *descriptor,
+   mtl_function_descriptor *shader)
+{
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_threads_per_threadgroup(
+   mtl_mesh_render_pipeline_descriptor *descriptor,
+   struct mtl_size object_threads, struct mtl_size mesh_threads)
+{
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_payload_length(
+   mtl_mesh_render_pipeline_descriptor *descriptor, uint32_t length)
+{
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_color_attachment_format(
+   mtl_mesh_render_pipeline_descriptor *descriptor, uint8_t index,
+   enum mtl_pixel_format format)
+{
+}
+
+void
+mtl_mesh_render_pipeline_descriptor_set_raster_sample_count(
+   mtl_mesh_render_pipeline_descriptor *descriptor, uint32_t sample_count)
+{
+}
+
 /* Render pipeline */
 mtl_render_pipeline_state *
 mtl_new_render_pipeline(mtl_compiler *compiler,

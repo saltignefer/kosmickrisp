@@ -258,7 +258,7 @@ struct kk_cmd_buffer {
       struct kk_graphics_state gfx;
       struct kk_compute_state cs;
       struct kk_conditional_rendering_state cond_render;
-      struct kk_shader *shaders[MESA_SHADER_STAGES];
+      struct kk_shader *shaders[MESA_SHADER_MESH_STAGES];
       /* Address of the binding 0 for when compute dispatches modify it.
        * We are trying to be nice to ourselves. */
       uint64_t root_addr;

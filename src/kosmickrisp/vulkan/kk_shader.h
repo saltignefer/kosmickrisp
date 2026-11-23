@@ -57,8 +57,22 @@ struct kk_shader_info {
    /* Outputs a VS, or a TES followed by a GS, writes for the next stage */
    uint64_t outputs_written;
 
+   /* The first stage of a graphics pipeline (vertex, task or mesh) holds the
+    * Metal pipeline and the vs data below. */
+   bool holds_pipeline;
+
+   /* Task and mesh stages. The pipeline holder carries the data of both. */
+   struct {
+      struct mtl_size task_local_size;
+      struct mtl_size mesh_local_size;
+      /* Primitive type the mesh shader outputs */
+      enum mesa_prim primitive_type;
+      /* Bytes of payload the task shader writes */
+      uint32_t payload_size;
+   } mesh;
+
    union {
-      /* Vertex shader is the pipeline, store all relevant data here. */
+      /* Pipeline holder data, see holds_pipeline. */
       struct {
          /* Required to know which extra states does the pipeline contain for
           * serialization. */
@@ -142,7 +156,7 @@ struct kk_shader {
 
    struct kk_pipeline_handles pipeline;
    struct kk_shader_info info;
-   struct msl_compile_data msl_data[MESA_SHADER_STAGES];
+   struct msl_compile_data msl_data[MESA_SHADER_MESH_STAGES];
    /* Compute pass of a GS. Its rasterization VS is in
     * msl_data[MESA_SHADER_GEOMETRY]. */
    struct msl_compile_data gs_main;

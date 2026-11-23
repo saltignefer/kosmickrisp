@@ -439,6 +439,34 @@ mtl_render_set_argument_table(mtl_render_encoder *encoder,
 }
 
 void
+mtl_draw_mesh_threadgroups(mtl_render_encoder *encoder,
+                           struct mtl_size threadgroups,
+                           struct mtl_size object_threads,
+                           struct mtl_size mesh_threads)
+{
+   @autoreleasepool {
+      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
+      [enc drawMeshThreadgroups:MTLSizeMake(threadgroups.x, threadgroups.y, threadgroups.z)
+          threadsPerObjectThreadgroup:MTLSizeMake(object_threads.x, object_threads.y, object_threads.z)
+            threadsPerMeshThreadgroup:MTLSizeMake(mesh_threads.x, mesh_threads.y, mesh_threads.z)];
+   }
+}
+
+void
+mtl_draw_mesh_threadgroups_indirect(mtl_render_encoder *encoder,
+                                    uint64_t indirect_addr,
+                                    struct mtl_size object_threads,
+                                    struct mtl_size mesh_threads)
+{
+   @autoreleasepool {
+      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
+      [enc drawMeshThreadgroupsWithIndirectBuffer:indirect_addr
+                      threadsPerObjectThreadgroup:MTLSizeMake(object_threads.x, object_threads.y, object_threads.z)
+                        threadsPerMeshThreadgroup:MTLSizeMake(mesh_threads.x, mesh_threads.y, mesh_threads.z)];
+   }
+}
+
+void
 mtl_draw_primitives(mtl_render_encoder *encoder,
                     enum mtl_primitive_type primitve_type, uint32_t vertexStart,
                     uint32_t vertexCount, uint32_t instanceCount,

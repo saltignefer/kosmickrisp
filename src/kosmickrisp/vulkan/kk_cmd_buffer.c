@@ -291,7 +291,8 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    /* Argument table won't ever change */
    mtl_render_set_argument_table(
       cmd->metal.render, cmd->argument_table,
-      MTL_RENDER_STAGE_VERTEX | MTL_RENDER_STAGE_FRAGMENT);
+      MTL_RENDER_STAGE_VERTEX | MTL_RENDER_STAGE_OBJECT |
+         MTL_RENDER_STAGE_MESH | MTL_RENDER_STAGE_FRAGMENT);
 
    kk_cmd_buffer_dirty_all_gfx(cmd);
 }
@@ -457,6 +458,11 @@ kk_barrier_requires_encoder_split(struct kk_cmd_buffer *cmd,
           (dst & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
 }
 
+/* VK_SHADER_STAGE_ALL_GRAPHICS does not include the task and mesh stages */
+#define KK_SHADER_STAGE_ALL_GRAPHICS                                           \
+   (VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |              \
+    VK_SHADER_STAGE_MESH_BIT_EXT)
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
@@ -477,8 +483,10 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          cs_end(cmd);
          cs_start_render(cmd);
       } else
-         mtl_barrier_after_encoder_stages(cmd->metal.render, MTL_STAGE_VERTEX,
-                                          MTL_STAGE_FRAGMENT);
+         mtl_barrier_after_encoder_stages(
+            cmd->metal.render,
+            MTL_STAGE_VERTEX | MTL_STAGE_OBJECTS | MTL_STAGE_MESH,
+            MTL_STAGE_FRAGMENT);
    } else if (cmd->metal.compute) {
       /* We chain encoders, so an intra-encoder barrier is enough here:
        * no need to tear down and recreate the encoder.
@@ -563,7 +571,7 @@ kk_CmdBindDescriptorSets2KHR(
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 
-   if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
+   if (pBindDescriptorSetsInfo->stageFlags & KK_SHADER_STAGE_ALL_GRAPHICS) {
       kk_bind_descriptor_sets(&cmd->state.gfx.descriptors,
                               pBindDescriptorSetsInfo);
    }
@@ -625,7 +633,7 @@ kk_CmdPushDescriptorSet2KHR(
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 
-   if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
+   if (pPushDescriptorSetInfo->stageFlags & KK_SHADER_STAGE_ALL_GRAPHICS) {
       kk_push_descriptor_set(cmd, &cmd->state.gfx.descriptors,
                              pPushDescriptorSetInfo);
    }
@@ -651,7 +659,7 @@ kk_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 
-   if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
+   if (pPushConstantsInfo->stageFlags & KK_SHADER_STAGE_ALL_GRAPHICS)
       kk_push_constants(cmd, &cmd->state.gfx.descriptors, pPushConstantsInfo);
 
    if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)

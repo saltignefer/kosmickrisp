@@ -276,6 +276,7 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
 {
    switch (instr->intrinsic) {
    case nir_intrinsic_load_input:
+   case nir_intrinsic_load_per_primitive_input:
    case nir_intrinsic_load_interpolated_input:
    case nir_intrinsic_load_output: {
       ti_type ty = ti_type_from_nir(nir_intrinsic_dest_type(instr));
@@ -328,6 +329,38 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
       set_type(types, &instr->src[0], ty);
       break;
    }
+   case nir_intrinsic_load_per_vertex_output:
+   case nir_intrinsic_load_per_primitive_output: {
+      ti_type ty = ti_type_from_nir(nir_intrinsic_dest_type(instr));
+      set_type(types, &instr->def, ty);
+      set_type(types, &instr->src[0], TYPE_UINT);
+      set_type(types, &instr->src[1], TYPE_UINT);
+      break;
+   }
+   case nir_intrinsic_store_per_vertex_output:
+   case nir_intrinsic_store_per_primitive_output: {
+      ti_type ty = ti_type_from_nir(nir_intrinsic_src_type(instr));
+      set_type(types, &instr->src[0], ty);
+      set_type(types, &instr->src[1], TYPE_UINT);
+      set_type(types, &instr->src[2], TYPE_UINT);
+      break;
+   }
+   case nir_intrinsic_load_task_payload:
+      set_type(types, &instr->def, TYPE_UINT);
+      set_type(types, &instr->src[0], TYPE_UINT);
+      break;
+   case nir_intrinsic_store_task_payload:
+      set_type(types, &instr->src[0], TYPE_UINT);
+      set_type(types, &instr->src[1], TYPE_UINT);
+      break;
+   case nir_intrinsic_launch_mesh_workgroups:
+      set_type(types, &instr->src[0], TYPE_UINT);
+      break;
+   case nir_intrinsic_set_vertex_and_primitive_count:
+      set_type(types, &instr->src[0], TYPE_UINT);
+      set_type(types, &instr->src[1], TYPE_UINT);
+      set_type(types, &instr->src[2], TYPE_UINT);
+      break;
    case nir_intrinsic_decl_reg:
       if (nir_intrinsic_bit_size(instr) == 1)
          set_type(types, &instr->def, TYPE_BOOL);

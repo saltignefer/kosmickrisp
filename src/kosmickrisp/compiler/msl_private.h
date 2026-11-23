@@ -74,6 +74,22 @@ void msl_input_name(struct nir_to_msl_ctx *ctx, unsigned location,
 void msl_output_name(struct nir_to_msl_ctx *ctx, unsigned location,
                      unsigned component, bool from_input);
 
+nir_alu_type msl_varying_member_type(unsigned location, nir_alu_type type);
+
+void msl_varying_member_type_name(struct nir_to_msl_ctx *ctx, unsigned location,
+                                  nir_alu_type type, unsigned num_components);
+
+uint64_t msl_mesh_vertex_outputs(const nir_shader *shader);
+
+uint64_t msl_mesh_primitive_outputs(const nir_shader *shader);
+
+unsigned msl_mesh_indices_per_primitive(const nir_shader *shader);
+
+bool msl_mesh_needs_default_point_size(const nir_shader *shader);
+
+void msl_mesh_output_name(struct nir_to_msl_ctx *ctx, unsigned location,
+                          unsigned component);
+
 uint32_t msl_input_num_components(struct nir_to_msl_ctx *ctx,
                                   uint32_t location);
 

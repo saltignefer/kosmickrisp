@@ -189,6 +189,9 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
       .EXT_memory_budget = true,
+      /* Only validated on Apple9 (M3) and later */
+      .EXT_mesh_shader = KK_EXPERIMENTAL(MESH_SHADER) &&
+                         pdev->info.gpu_apple_family >= 9,
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
       .EXT_nested_command_buffer = true,
@@ -481,6 +484,13 @@ kk_get_device_features(
       .memoryMapPlaced = true,
       .memoryMapRangePlaced = false,
       .memoryUnmapReserve = true,
+
+      /* VK_EXT_mesh_shader */
+      .meshShader = supported_extensions->EXT_mesh_shader,
+      .taskShader = supported_extensions->EXT_mesh_shader,
+      .multiviewMeshShader = false,
+      .primitiveFragmentShadingRateMeshShader = false,
+      .meshShaderQueries = false,
 
       /* VK_EXT_multi_draw */
       .multiDraw = true,
@@ -842,6 +852,44 @@ kk_get_device_properties(
 
       /* VK_EXT_map_memory_placed */
       .minPlacedMemoryMapAlignment = os_page_size,
+
+      /* VK_EXT_mesh_shader. Metal allows 256 vertices, 512 primitives and
+       * 32 KiB of output per mesh threadgroup, and no more than 124 varying
+       * components. Mesh outputs are staged in threadgroup memory, and
+       * threadgroup memory plus output may not exceed 60 KiB, which leaves
+       * 28 KiB of output. Object functions reserve 16 bytes of threadgroup
+       * memory. Metal drops draws, and mesh grids launched by object
+       * functions, of 2^20 threadgroups or more. Some of these values are
+       * below the Vulkan minimums, which is why mesh shaders are
+       * experimental. */
+      .maxTaskWorkGroupTotalCount = (1u << 20) - 1u,
+      .maxTaskWorkGroupCount = {65535, 65535, 65535},
+      .maxTaskWorkGroupInvocations = 128,
+      .maxTaskWorkGroupSize = {128, 128, 128},
+      .maxTaskPayloadSize = 16384,
+      .maxTaskSharedMemorySize = 32752,
+      .maxTaskPayloadAndSharedMemorySize = 32752,
+      .maxMeshWorkGroupTotalCount = (1u << 20) - 1u,
+      .maxMeshWorkGroupCount = {65535, 65535, 65535},
+      .maxMeshWorkGroupInvocations = 256,
+      .maxMeshWorkGroupSize = {256, 256, 256},
+      .maxMeshSharedMemorySize = 28672,
+      .maxMeshPayloadAndSharedMemorySize = 28672,
+      .maxMeshOutputMemorySize = 28672,
+      .maxMeshPayloadAndOutputMemorySize = 45056,
+      .maxMeshOutputComponents = 124,
+      .maxMeshOutputVertices = 256,
+      .maxMeshOutputPrimitives = 256,
+      .maxMeshOutputLayers = 8,
+      .maxMeshMultiviewViewCount = 1,
+      .meshOutputPerVertexGranularity = 1,
+      .meshOutputPerPrimitiveGranularity = 1,
+      .maxPreferredTaskWorkGroupInvocations = 32,
+      .maxPreferredMeshWorkGroupInvocations = 32,
+      .prefersLocalInvocationVertexOutput = false,
+      .prefersLocalInvocationPrimitiveOutput = false,
+      .prefersCompactVertexOutput = false,
+      .prefersCompactPrimitiveOutput = false,
 
       /* VK_EXT_multi_draw */
       .maxMultiDrawCount = UINT32_MAX,

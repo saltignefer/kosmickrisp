@@ -69,7 +69,7 @@ struct kk_meta_save {
    struct vk_vertex_input_state _dynamic_vi;
    struct vk_sample_locations_state _dynamic_sl;
    struct vk_dynamic_graphics_state dynamic;
-   struct kk_shader *shaders[MESA_SHADER_STAGES];
+   struct kk_shader *shaders[MESA_SHADER_MESH_STAGES];
    struct {
       union {
          struct {
@@ -103,6 +103,8 @@ kk_meta_begin(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
       for (uint32_t stage = 0u; stage < MESA_SHADER_COMPUTE; ++stage) {
          save->shaders[stage] = cmd->state.shaders[stage];
       }
+      save->shaders[MESA_SHADER_TASK] = cmd->state.shaders[MESA_SHADER_TASK];
+      save->shaders[MESA_SHADER_MESH] = cmd->state.shaders[MESA_SHADER_MESH];
 
       save->pipeline.gfx.ds = cmd->state.gfx.depth_stencil_state;
       save->pipeline.gfx.occlusion = cmd->state.gfx.occlusion.mode;
@@ -176,7 +178,11 @@ kk_meta_end(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
       for (uint32_t stage = 0u; stage < MESA_SHADER_COMPUTE; ++stage) {
          cmd->state.shaders[stage] = save->shaders[stage];
       }
-      cmd->state.dirty_shaders |= BITFIELD_MASK(MESA_SHADER_COMPUTE);
+      cmd->state.shaders[MESA_SHADER_TASK] = save->shaders[MESA_SHADER_TASK];
+      cmd->state.shaders[MESA_SHADER_MESH] = save->shaders[MESA_SHADER_MESH];
+      cmd->state.dirty_shaders |= BITFIELD_MASK(MESA_SHADER_COMPUTE) |
+                                  BITFIELD_BIT(MESA_SHADER_TASK) |
+                                  BITFIELD_BIT(MESA_SHADER_MESH);
 
       if (cmd->state.gfx.is_depth_stencil_dynamic)
          mtl_release(cmd->state.gfx.depth_stencil_state);

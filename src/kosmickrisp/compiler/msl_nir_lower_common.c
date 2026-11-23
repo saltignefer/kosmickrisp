@@ -16,7 +16,8 @@ bool
 msl_nir_vs_remove_point_size_write(nir_builder *b, nir_intrinsic_instr *intrin,
                                    void *data)
 {
-   if (intrin->intrinsic != nir_intrinsic_store_output)
+   if (intrin->intrinsic != nir_intrinsic_store_output &&
+       intrin->intrinsic != nir_intrinsic_store_per_vertex_output)
       return false;
 
    nir_io_semantics io = nir_intrinsic_io_semantics(intrin);
@@ -446,7 +447,8 @@ msl_ensure_vertex_point_size_output(nir_shader *nir)
 static bool
 msl_fs_io_types(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   if (intr->intrinsic == nir_intrinsic_load_input) {
+   if (intr->intrinsic == nir_intrinsic_load_input ||
+       intr->intrinsic == nir_intrinsic_load_per_primitive_input) {
       struct nir_io_semantics io = nir_intrinsic_io_semantics(intr);
       if (io.location == VARYING_SLOT_VIEWPORT) {
          nir_intrinsic_set_dest_type(intr, nir_type_uint32);
@@ -491,7 +493,8 @@ msl_nir_fs_io_types(nir_shader *nir)
 static bool
 msl_vs_io_types(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   if (intr->intrinsic == nir_intrinsic_store_output) {
+   if (intr->intrinsic == nir_intrinsic_store_output ||
+       intr->intrinsic == nir_intrinsic_store_per_primitive_output) {
       struct nir_io_semantics io = nir_intrinsic_io_semantics(intr);
       if (io.location == VARYING_SLOT_LAYER ||
           io.location == VARYING_SLOT_VIEWPORT) {
@@ -507,7 +510,8 @@ bool
 msl_nir_vs_io_types(nir_shader *nir)
 {
    assert(nir->info.stage == MESA_SHADER_VERTEX ||
-          nir->info.stage == MESA_SHADER_TESS_EVAL);
+          nir->info.stage == MESA_SHADER_TESS_EVAL ||
+          nir->info.stage == MESA_SHADER_MESH);
    return nir_shader_intrinsics_pass(nir, msl_vs_io_types, nir_metadata_all,
                                      NULL);
 }
@@ -729,7 +733,9 @@ static bool
 scalarize_clip_cull_distance_filter(const nir_intrinsic_instr *intrin,
                                     UNUSED const void *_data)
 {
-   if (intrin->intrinsic != nir_intrinsic_store_output)
+   if (intrin->intrinsic != nir_intrinsic_store_output &&
+       intrin->intrinsic != nir_intrinsic_store_per_vertex_output &&
+       intrin->intrinsic != nir_intrinsic_load_per_vertex_output)
       return false;
    nir_io_semantics semantics = nir_intrinsic_io_semantics(intrin);
    return semantics.location == VARYING_SLOT_CLIP_DIST0 ||
@@ -744,9 +750,10 @@ msl_nir_lower_clip_cull_distance(nir_shader *nir, unsigned num_cull_distances)
    NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out,
             scalarize_clip_cull_distance_filter, NULL);
    NIR_PASS(_, nir, nir_separate_merged_clip_cull_io);
+   /* The MSL backend handles mesh clip and cull distances */
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, msl_nir_lower_cull_distance_fs, num_cull_distances);
-   else
+   else if (nir->info.stage != MESA_SHADER_MESH)
       NIR_PASS(_, nir, msl_nir_lower_clip_cull_distance_vs);
 }
 

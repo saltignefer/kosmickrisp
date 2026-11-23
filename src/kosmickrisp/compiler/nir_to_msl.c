@@ -17,6 +17,10 @@ get_stage_string(mesa_shader_stage stage)
       return "vertex";
    case MESA_SHADER_FRAGMENT:
       return "fragment";
+   case MESA_SHADER_TASK:
+      return "[[object]]";
+   case MESA_SHADER_MESH:
+      return "[[mesh]]";
    case MESA_SHADER_COMPUTE:
    case MESA_SHADER_TESS_CTRL:
       return "kernel";
@@ -997,7 +1001,12 @@ memory_modes_to_msl(struct nir_to_msl_ctx *ctx, nir_variable_mode modes)
          P(ctx, "mem_flags::mem_none");
          break;
       case nir_var_mem_shared:
+      /* Mesh outputs are staged in threadgroup memory */
+      case nir_var_shader_out:
          P(ctx, "mem_flags::mem_threadgroup");
+         break;
+      case nir_var_mem_task_payload:
+         P(ctx, "mem_flags::mem_object_data");
          break;
       default:
          UNREACHABLE("bad_memory_mode");
@@ -1091,6 +1100,212 @@ global_access_qualifier(struct nir_to_msl_ctx *ctx,
       return "volatile device";
    }
    return access & ACCESS_COHERENT ? "coherent device" : "device";
+}
+
+/* Whether a varying access goes through a conversion, see
+ * msl_varying_member_type */
+static bool
+varying_access_converts(uint32_t location, nir_intrinsic_instr *instr)
+{
+   nir_alu_type type = nir_intrinsic_has_dest_type(instr)
+                          ? nir_intrinsic_dest_type(instr)
+                          : nir_intrinsic_src_type(instr);
+   return msl_varying_member_type(location, type) != type;
+}
+
+/* Value of a varying store, the written components of the source */
+static void
+varying_store_src_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
+                         uint32_t location)
+{
+   uint32_t write_mask = nir_intrinsic_write_mask(instr);
+   bool convert = varying_access_converts(location, instr);
+   if (convert) {
+      msl_varying_member_type_name(ctx, location, nir_intrinsic_src_type(instr),
+                                   util_bitcount(write_mask));
+      P(ctx, "(");
+   }
+   src_to_msl(ctx, &instr->src[0]);
+   if (instr->num_components > 1u) {
+      P(ctx, ".");
+      u_foreach_bit(i, write_mask)
+         P(ctx, "%c", "xyzw"[i]);
+   }
+   if (convert)
+      P(ctx, ")");
+}
+
+/* Mesh output intrinsics address the threadgroup copies of the output
+ * structs, indexed by vertex or primitive. */
+static void
+mesh_output_ref(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
+                uint32_t location, uint32_t component)
+{
+   bool per_primitive =
+      instr->intrinsic == nir_intrinsic_store_per_primitive_output ||
+      instr->intrinsic == nir_intrinsic_load_per_primitive_output;
+   nir_src *index = nir_get_io_arrayed_index_src(instr);
+
+   P(ctx, "%s[", per_primitive ? "kk_mesh_prims" : "kk_mesh_verts");
+   src_to_msl(ctx, index);
+   P(ctx, "].");
+   msl_mesh_output_name(ctx, location, component);
+}
+
+static void
+mesh_index_ref(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
+               uint32_t component)
+{
+   P(ctx, "kk_mesh_indices[(");
+   src_to_msl(ctx, nir_get_io_arrayed_index_src(instr));
+   P(ctx, ") * %u + %u]", msl_mesh_indices_per_primitive(ctx->shader),
+     component);
+}
+
+/* Clip and cull distances of mesh vertices, scalarized */
+static bool
+mesh_distance_ref(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr,
+                  uint32_t location)
+{
+   bool clip = location == VARYING_SLOT_CLIP_DIST0 ||
+               location == VARYING_SLOT_CLIP_DIST1;
+   bool cull = location == VARYING_SLOT_CULL_DIST0 ||
+               location == VARYING_SLOT_CULL_DIST1;
+   if (!clip && !cull)
+      return false;
+
+   assert(instr->num_components == 1u && "must be scalarized");
+   uint32_t base = clip ? VARYING_SLOT_CLIP_DIST0 : VARYING_SLOT_CULL_DIST0;
+   uint32_t index = (location - base) * 4u + nir_intrinsic_component(instr);
+   if (clip) {
+      P(ctx, "kk_mesh_verts[");
+      src_to_msl(ctx, nir_get_io_arrayed_index_src(instr));
+      P(ctx, "].gl_ClipDistance[%u]", index);
+   } else {
+      P(ctx, "kk_mesh_cull_distances[");
+      src_to_msl(ctx, nir_get_io_arrayed_index_src(instr));
+      P(ctx, "][%u]", index);
+   }
+   return true;
+}
+
+static void
+mesh_store_output_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+{
+   nir_io_semantics io = nir_intrinsic_io_semantics(instr);
+   uint32_t location =
+      io.location + nir_src_as_uint(*nir_get_io_offset_src(instr));
+   uint32_t write_mask = nir_intrinsic_write_mask(instr);
+   uint32_t component = nir_intrinsic_component(instr);
+   uint32_t num_components = instr->num_components;
+
+   if (location == VARYING_SLOT_PRIMITIVE_INDICES) {
+      u_foreach_bit(i, write_mask) {
+         P_INDENT(ctx);
+         mesh_index_ref(ctx, instr, component + i);
+         P(ctx, " = uchar(");
+         src_to_msl(ctx, &instr->src[0]);
+         if (num_components > 1u)
+            P(ctx, ".%c", "xyzw"[i]);
+         P(ctx, ");\n");
+      }
+      return;
+   }
+
+   if (location == VARYING_SLOT_CULL_PRIMITIVE) {
+      P_INDENT(ctx);
+      mesh_output_ref(ctx, instr, location, 0);
+      P(ctx, " = bool(");
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, ");\n");
+      return;
+   }
+
+   P_INDENT(ctx);
+   if (mesh_distance_ref(ctx, instr, location)) {
+      P(ctx, " = float(");
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, ");\n");
+      return;
+   }
+
+   mesh_output_ref(ctx, instr, location, component);
+   if (msl_output_num_components(ctx, location) > 1u) {
+      P(ctx, ".");
+      u_foreach_bit(i, write_mask)
+         P(ctx, "%c", "xyzw"[component + i]);
+   }
+   P(ctx, " = ");
+   varying_store_src_to_msl(ctx, instr, location);
+   P(ctx, ";\n");
+}
+
+static void
+mesh_load_output_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+{
+   nir_io_semantics io = nir_intrinsic_io_semantics(instr);
+   uint32_t location =
+      io.location + nir_src_as_uint(*nir_get_io_offset_src(instr));
+   uint32_t component = nir_intrinsic_component(instr);
+
+   if (location == VARYING_SLOT_PRIMITIVE_INDICES) {
+      P(ctx, "%s(", msl_type_for_def(ctx->types, &instr->def));
+      for (unsigned i = 0; i < instr->num_components; i++) {
+         if (i)
+            P(ctx, ", ");
+         mesh_index_ref(ctx, instr, component + i);
+      }
+      P(ctx, ");\n");
+      return;
+   }
+
+   if (location == VARYING_SLOT_CULL_PRIMITIVE) {
+      P(ctx, "%s(", msl_type_for_def(ctx->types, &instr->def));
+      mesh_output_ref(ctx, instr, location, 0);
+      P(ctx, ");\n");
+      return;
+   }
+
+   if (location >= VARYING_SLOT_CLIP_DIST0 &&
+       location <= VARYING_SLOT_CULL_DIST1) {
+      P(ctx, "%s(", msl_type_for_def(ctx->types, &instr->def));
+      mesh_distance_ref(ctx, instr, location);
+      P(ctx, ");\n");
+      return;
+   }
+
+   bool convert = varying_access_converts(location, instr);
+   if (convert)
+      P(ctx, "%s(", msl_type_for_def(ctx->types, &instr->def));
+   mesh_output_ref(ctx, instr, location, component);
+   if (instr->num_components < msl_output_num_components(ctx, location)) {
+      P(ctx, ".");
+      for (unsigned i = 0; i < instr->num_components; i++)
+         P(ctx, "%c", "xyzw"[component + i]);
+   }
+   P(ctx, "%s;\n", convert ? ")" : "");
+}
+
+static bool
+is_load_task_payload(UNUSED nir_builder *b, nir_intrinsic_instr *intr,
+                     UNUSED void *data)
+{
+   return intr->intrinsic == nir_intrinsic_load_task_payload;
+}
+
+static bool
+mesh_reads_payload(nir_shader *shader)
+{
+   return nir_shader_intrinsics_pass(shader, is_load_task_payload,
+                                     nir_metadata_all, NULL);
+}
+
+/* Task shaders write the payload, mesh shaders read it */
+static const char *
+payload_address_space(struct nir_to_msl_ctx *ctx)
+{
+   return ctx->shader->info.stage == MESA_SHADER_TASK ? "object_data"
+                                                      : "const object_data";
 }
 
 static void
@@ -1241,6 +1456,9 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       uint32_t component = nir_intrinsic_component(instr);
       uint32_t location = io.location + idx;
 
+      bool convert = varying_access_converts(location, instr);
+      if (convert)
+         P(ctx, "%s(", msl_type_for_def(ctx->types, &instr->def));
       msl_input_name(ctx, location, component);
       if (ctx->inputs_info[location].uses_interpolant)
          msl_interpolant_method(ctx, &instr->src[0u]);
@@ -1249,22 +1467,27 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
          for (unsigned i = 0; i < instr->num_components; i++)
             P(ctx, "%c", "xyzw"[component + i]);
       }
-      P(ctx, ";\n");
+      P(ctx, "%s;\n", convert ? ")" : "");
       break;
    }
-   case nir_intrinsic_load_input: {
+   case nir_intrinsic_load_input:
+   /* Per-primitive inputs are flat inputs to Metal */
+   case nir_intrinsic_load_per_primitive_input: {
       unsigned idx = nir_src_as_uint(instr->src[0u]);
       nir_io_semantics io = nir_intrinsic_io_semantics(instr);
       uint32_t component = nir_intrinsic_component(instr);
       uint32_t location = io.location + idx;
 
+      bool convert = varying_access_converts(location, instr);
+      if (convert)
+         P(ctx, "%s(", msl_type_for_def(ctx->types, &instr->def));
       msl_input_name(ctx, location, component);
       if (instr->num_components < msl_input_num_components(ctx, location)) {
          P(ctx, ".");
          for (unsigned i = 0; i < instr->num_components; i++)
             P(ctx, "%c", "xyzw"[component + i]);
       }
-      P(ctx, ";\n");
+      P(ctx, "%s;\n", convert ? ")" : "");
       break;
    }
    case nir_intrinsic_load_sample_pos_from_id: {
@@ -1322,16 +1545,28 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
                P(ctx, "%c", "xyzw"[component + i]);
       }
       P(ctx, " = ");
-      src_to_msl(ctx, &instr->src[0]);
-      if (num_components > 1u) {
-         P(ctx, ".");
-         for (unsigned i = 0; i < num_components; i++)
-            if ((write_mask >> i) & 1)
-               P(ctx, "%c", "xyzw"[i]);
-      }
+      varying_store_src_to_msl(ctx, instr, location);
       P(ctx, ";\n");
       break;
    }
+   case nir_intrinsic_store_per_vertex_output:
+   case nir_intrinsic_store_per_primitive_output:
+      mesh_store_output_to_msl(ctx, instr);
+      break;
+   case nir_intrinsic_load_per_vertex_output:
+   case nir_intrinsic_load_per_primitive_output:
+      mesh_load_output_to_msl(ctx, instr);
+      break;
+   case nir_intrinsic_set_vertex_and_primitive_count:
+      P_IND(ctx, "if (gl_LocalInvocationIndex == 0u) {\n");
+      P_IND(ctx, "    kk_mesh_vertex_count = ");
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, ";\n");
+      P_IND(ctx, "    kk_mesh_primitive_count = ");
+      src_to_msl(ctx, &instr->src[1]);
+      P(ctx, ";\n");
+      P_IND(ctx, "}\n");
+      break;
    case nir_intrinsic_load_push_constant: {
       const char *ty = msl_type_for_def(ctx->types, &instr->def);
       assert(nir_intrinsic_base(instr) == 0);
@@ -1528,6 +1763,41 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
          writemask_to_msl(ctx, nir_intrinsic_write_mask(instr),
                           instr->num_components);
       P(ctx, ";\n");
+      break;
+   /* Payload offsets only have scalar alignment, so vectors go through
+    * packed types */
+   case nir_intrinsic_load_task_payload: {
+      const char *type = msl_type_for_def(ctx->types, &instr->def);
+      bool packed = instr->def.num_components > 1;
+      P(ctx, "%s(*(%s %s%s*)&kk_payload[%u + ", type,
+        payload_address_space(ctx), packed ? "packed_" : "", type,
+        nir_intrinsic_base(instr));
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, "]);\n");
+      break;
+   }
+   case nir_intrinsic_store_task_payload:
+      P_IND(ctx, "(*(object_data %s%s*)&kk_payload[%u + ",
+            instr->src[0].ssa->num_components > 1 ? "packed_" : "",
+            msl_type_for_src(ctx->types, &instr->src[0]),
+            nir_intrinsic_base(instr));
+      src_to_msl(ctx, &instr->src[1]);
+      P(ctx, "])");
+      writemask_to_msl(ctx, nir_intrinsic_write_mask(instr),
+                       instr->num_components);
+      P(ctx, " = ");
+      src_to_msl(ctx, &instr->src[0]);
+      if (instr->src[0].ssa->num_components > 1)
+         writemask_to_msl(ctx, nir_intrinsic_write_mask(instr),
+                          instr->num_components);
+      P(ctx, ";\n");
+      break;
+   case nir_intrinsic_launch_mesh_workgroups:
+      /* Terminates the invocation, see the halt that follows */
+      P_IND(ctx, "if (gl_LocalInvocationIndex == 0u)\n");
+      P_IND(ctx, "    kk_mesh_grid.set_threadgroups_per_grid(uint3(");
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, "));\n");
       break;
    case nir_intrinsic_load_constant:
       P(ctx, "*(constant %s*)((constant uchar *)constant_data + %u + ",
@@ -2021,6 +2291,12 @@ jump_instr_to_msl(struct nir_to_msl_ctx *ctx, nir_jump_instr *jump)
 {
    switch (jump->type) {
    case nir_jump_halt:
+      /* Follows launch_mesh_workgroups, which ends a task invocation */
+      if (ctx->shader->info.stage == MESA_SHADER_TASK) {
+         P_IND(ctx, "return;\n");
+         break;
+      }
+      FALLTHROUGH;
    case nir_jump_abort:
       P_IND(ctx, "TODO: halt/abort\n");
       assert(!"Unimplemented");
@@ -2187,12 +2463,77 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
    }
 }
 
+/* Hand the staged mesh outputs to Metal. Early returns were lowered away, so
+ * every thread of the threadgroup reaches the barrier. */
+static void
+emit_mesh_epilogue(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+{
+   unsigned threads = shader->info.workgroup_size[0] *
+                      shader->info.workgroup_size[1] *
+                      shader->info.workgroup_size[2];
+   unsigned indices = msl_mesh_indices_per_primitive(shader);
+
+   P_IND(ctx, "threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+   P_IND(ctx,
+         "for (uint i = gl_LocalInvocationIndex; i < kk_mesh_vertex_count; "
+         "i += %u)\n",
+         threads);
+   if (msl_mesh_needs_default_point_size(shader)) {
+      P_IND(ctx, "{\n");
+      P_IND(ctx, "    VertexOut kk_vertex = kk_mesh_verts[i];\n");
+      P_IND(ctx, "    kk_vertex.point_size = 1.0f;\n");
+      P_IND(ctx, "    kk_mesh.set_vertex(i, kk_vertex);\n");
+      P_IND(ctx, "}\n");
+   } else {
+      P_IND(ctx, "    kk_mesh.set_vertex(i, kk_mesh_verts[i]);\n");
+   }
+   P_IND(ctx,
+         "for (uint i = gl_LocalInvocationIndex; i < kk_mesh_primitive_count; "
+         "i += %u) {\n",
+         threads);
+   ctx->indentlevel++;
+   if (shader->info.cull_distance_array_size) {
+      /* A primitive is culled if all its vertices have a negative value for
+       * the same cull distance */
+      P_IND(ctx, "%s kk_primitive = kk_mesh_prims[i];\n", "PrimitiveOut");
+      P_IND(ctx, "bool kk_culled = %s;\n",
+            (shader->info.outputs_written & VARYING_BIT_CULL_PRIMITIVE)
+               ? "kk_primitive.cull_primitive"
+               : "false");
+      for (unsigned d = 0; d < shader->info.cull_distance_array_size; d++) {
+         P_IND(ctx, "kk_culled = kk_culled || (");
+         for (unsigned c = 0; c < indices; c++) {
+            P(ctx,
+              "%skk_mesh_cull_distances[kk_mesh_indices[i * %u + %u]][%u] < "
+              "0.0f",
+              c ? " && " : "", indices, c, d);
+         }
+         P(ctx, ");\n");
+      }
+      P_IND(ctx, "kk_primitive.cull_primitive = kk_culled;\n");
+      P_IND(ctx, "kk_mesh.set_primitive(i, kk_primitive);\n");
+   } else if (msl_mesh_primitive_outputs(shader)) {
+      P_IND(ctx, "kk_mesh.set_primitive(i, kk_mesh_prims[i]);\n");
+   }
+   for (unsigned c = 0; c < indices; c++)
+      P_IND(ctx,
+            "kk_mesh.set_index(i * %u + %u, kk_mesh_indices[i * %u + %u]);\n",
+            indices, c, indices, c);
+   ctx->indentlevel--;
+   P_IND(ctx, "}\n");
+   P_IND(ctx, "if (gl_LocalInvocationIndex == 0u)\n");
+   P_IND(ctx, "    kk_mesh.set_primitive_count(kk_mesh_primitive_count);\n");
+}
+
 static void
 emit_output_return(struct nir_to_msl_ctx *ctx, nir_shader *shader)
 {
    if (shader->info.stage == MESA_SHADER_VERTEX ||
-       shader->info.stage == MESA_SHADER_FRAGMENT)
+       shader->info.stage == MESA_SHADER_FRAGMENT) {
       P_IND(ctx, "return out;\n");
+   } else if (shader->info.stage == MESA_SHADER_MESH) {
+      emit_mesh_epilogue(ctx, shader);
+   }
 }
 
 static void
@@ -2277,8 +2618,13 @@ msl_preprocess_nir(struct nir_shader *nir)
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_memcpy);
 
-   NIR_PASS(_, nir, nir_split_array_vars,
-            nir_var_function_temp | nir_var_shader_in | nir_var_shader_out);
+   /* Mesh outputs are arrayed over the whole workgroup and get indexed by
+    * vertex or primitive, keep them in one piece. */
+   nir_variable_mode io_modes = nir_var_shader_in | nir_var_shader_out;
+   if (nir->info.stage == MESA_SHADER_MESH)
+      io_modes &= ~nir_var_shader_out;
+
+   NIR_PASS(_, nir, nir_split_array_vars, nir_var_function_temp | io_modes);
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, kk_scalarize_filter, NULL);
 
    NIR_PASS(_, nir, nir_opt_large_constants, glsl_get_natural_size_align_bytes,
@@ -2289,8 +2635,7 @@ msl_preprocess_nir(struct nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_vars_to_scratch, 32,
             glsl_get_natural_size_align_bytes, glsl_get_word_size_align_bytes);
    NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
-            nir_var_function_temp | nir_var_shader_in | nir_var_shader_out,
-            UINT32_MAX);
+            nir_var_function_temp | io_modes, UINT32_MAX);
 
    msl_nir_lower_subgroups(nir);
 }
@@ -2390,6 +2735,22 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
     * moment. */
    nir_index_blocks(impl);
    nir_index_ssa_defs(impl);
+
+   /* Task shaders launch the mesh grid from the first invocation */
+   if (ctx->shader->info.stage == MESA_SHADER_TASK)
+      BITSET_SET(ctx->shader->info.system_values_read,
+                 SYSTEM_VALUE_LOCAL_INVOCATION_INDEX);
+
+   if (ctx->shader->info.stage == MESA_SHADER_MESH) {
+      msl_gather_io_info(ctx, ctx->inputs_info, ctx->outputs_info);
+      /* Metal positions are float4, even if the shader writes fewer
+       * components */
+      ctx->outputs_info[VARYING_SLOT_POS].type = nir_type_float32;
+      ctx->outputs_info[VARYING_SLOT_POS].num_components = 4;
+      /* The epilogue splits the output work among the threads */
+      BITSET_SET(ctx->shader->info.system_values_read,
+                 SYSTEM_VALUE_LOCAL_INVOCATION_INDEX);
+   }
 
    if (ctx->shader->info.stage == MESA_SHADER_VERTEX ||
        ctx->shader->info.stage == MESA_SHADER_FRAGMENT) {
@@ -2512,7 +2873,8 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
 
    P(&ctx, "// Generated by Mesa compiler\n");
    if (shader->info.stage == MESA_SHADER_COMPUTE ||
-       shader->info.stage == MESA_SHADER_TESS_CTRL)
+       shader->info.stage == MESA_SHADER_TESS_CTRL ||
+       shader->info.stage == MESA_SHADER_TASK)
       P(&ctx, "#include <metal_compute>\n");
    P(&ctx, "#include <metal_stdlib>\n");
    P(&ctx, "using namespace metal;\n");
@@ -2526,6 +2888,15 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
    P(&ctx, "%s %s %s(\n", get_stage_string(shader->info.stage),
      output_type(shader), get_entrypoint_name(shader));
    ctx.indentlevel++;
+   if (shader->info.stage == MESA_SHADER_TASK) {
+      P_IND(&ctx, "object_data uchar *kk_payload [[payload]],\n");
+      P_IND(&ctx, "mesh_grid_properties kk_mesh_grid,\n");
+   }
+   if (shader->info.stage == MESA_SHADER_MESH) {
+      P_IND(&ctx, "kk_mesh_t kk_mesh,\n");
+      if (mesh_reads_payload(shader))
+         P_IND(&ctx, "const object_data uchar *kk_payload [[payload]],\n");
+   }
    emit_sysvals(&ctx, shader);
    emit_inputs(&ctx, shader);
    ctx.indentlevel--;
