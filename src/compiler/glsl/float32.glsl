@@ -518,7 +518,7 @@ __fadd32(uint a, uint b)
       zExp = mix(bExp, aExp, sign_of_difference == 0u);
       aSign ^= sign_of_difference;
       uint retval_0 = __packFloat32(uint(FLOAT_ROUNDING_MODE == FLOAT_ROUND_DOWN) << 31, 0, 0u);
-      uint retval_1 = __normalizeRoundAndPackFloat32(aSign, zExp, zFrac);
+      uint retval_1 = __normalizeRoundAndPackFloat32(aSign, zExp - 1, zFrac);
       return mix(retval_0, retval_1, zFrac != 0u);
    }
 }
