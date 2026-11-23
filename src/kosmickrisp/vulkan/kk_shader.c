@@ -739,6 +739,71 @@ kk_nir_lower_mesh_indirect_slots(nir_shader *nir)
                                      nir_metadata_none, NULL);
 }
 
+static bool
+lower_mesh_global_invocation_id(nir_builder *b, nir_intrinsic_instr *intr,
+                                UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global_invocation_id)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *size = nir_imm_ivec3(b, b->shader->info.workgroup_size[0],
+                                 b->shader->info.workgroup_size[1],
+                                 b->shader->info.workgroup_size[2]);
+   nir_def *id = nir_iadd(b, nir_imul(b, nir_load_workgroup_id(b), size),
+                          nir_load_local_invocation_id(b));
+   nir_def_replace(&intr->def, nir_u2uN(b, id, intr->def.bit_size));
+   return true;
+}
+
+static bool
+lower_mesh_grid_sysvals(nir_builder *b, nir_intrinsic_instr *intr,
+                        UNUSED void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_workgroup_id: {
+      /* Keep the load, it is the position in the chunk */
+      b->cursor = nir_after_instr(&intr->instr);
+      nir_def *base = nir_load_task_payload(b, 2, 32, nir_imm_int(b, 0),
+                                            .base = KK_MESH_GRID_PAYLOAD_BASE,
+                                            .align_mul = 4u);
+      nir_def *id =
+         nir_iadd(b, &intr->def,
+                  nir_vec3(b, nir_imm_int(b, 0), nir_channel(b, base, 0),
+                           nir_channel(b, base, 1)));
+      nir_def_rewrite_uses_after(&intr->def, id);
+      return true;
+   }
+   case nir_intrinsic_load_num_workgroups: {
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *counts = nir_load_task_payload(
+         b, 3, 32, nir_imm_int(b, 0), .base = KK_MESH_GRID_PAYLOAD_COUNTS,
+         .align_mul = 4u);
+      nir_def_replace(&intr->def, counts);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* A mesh shader without task shader runs in chunks launched by the synthetic
+ * object stage, see KK_MESH_GRID_MAX_CHUNKS. The Metal threadgroup position
+ * and grid size are those of the chunk, so derive the Vulkan workgroup ID,
+ * group counts and global invocation ID from the payload. The device staging
+ * slot keeps using the Metal values, see mesh_device_staging_var.
+ */
+bool
+kk_nir_lower_mesh_grid(nir_shader *nir)
+{
+   assert(nir->info.stage == MESA_SHADER_MESH);
+   bool progress = nir_shader_intrinsics_pass(
+      nir, lower_mesh_global_invocation_id, nir_metadata_control_flow, NULL);
+   progress |= nir_shader_intrinsics_pass(nir, lower_mesh_grid_sysvals,
+                                          nir_metadata_control_flow, NULL);
+   return progress;
+}
+
 /* Lowering for the mesh stage, the counterpart of kk_lower_hw_vs */
 static void
 kk_lower_hw_mesh(nir_shader *nir)
@@ -2034,19 +2099,28 @@ kk_compile_mesh_pipeline(struct kk_device *device, struct kk_shader *holder)
                                                          data->entrypoint_name);
    }
 
+   /* Without task shader, the mesh grid goes through the synthetic object
+    * stage, see KK_MESH_GRID_MAX_CHUNKS */
+   struct mtl_size task_local_size = info->mesh.task_local_size;
+   uint32_t payload_size = align(MAX2(info->mesh.payload_size, 16u), 16u);
+   if (!functions[0]) {
+      functions[0] = mtl_new_library_function_descriptor(
+         device->mesh_grid_object, "kk_mesh_grid_object");
+      task_local_size = (struct mtl_size){1u, 1u, 1u};
+      payload_size = KK_MESH_GRID_PAYLOAD_SIZE;
+   }
+
    descriptor = mtl_new_mesh_render_pipeline_descriptor();
-   if (functions[0])
-      mtl_mesh_render_pipeline_descriptor_set_object_shader(descriptor,
-                                                            functions[0]);
+   mtl_mesh_render_pipeline_descriptor_set_object_shader(descriptor,
+                                                         functions[0]);
    mtl_mesh_render_pipeline_descriptor_set_mesh_shader(descriptor,
                                                        functions[1]);
    mtl_mesh_render_pipeline_descriptor_set_fragment_shader(descriptor,
                                                            functions[2]);
    mtl_mesh_render_pipeline_descriptor_set_threads_per_threadgroup(
-      descriptor, info->mesh.task_local_size, info->mesh.mesh_local_size);
-   if (functions[0])
-      mtl_mesh_render_pipeline_descriptor_set_payload_length(
-         descriptor, align(MAX2(info->mesh.payload_size, 16u), 16u));
+      descriptor, task_local_size, info->mesh.mesh_local_size);
+   mtl_mesh_render_pipeline_descriptor_set_payload_length(descriptor,
+                                                          payload_size);
 
    for (uint8_t i = 0; i < MAX_DRAW_BUFFERS; ++i) {
       if (info->vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID)
@@ -2397,8 +2471,13 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
                                   VK_SHADER_STAGE_GEOMETRY_BIT);
 
       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
+      bool io_lowered = nir->info.io_lowered;
       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
                    info->set_layout_count, info->set_layouts, state, features);
+
+      if (!io_lowered && nir->info.stage == MESA_SHADER_MESH &&
+          (info->flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT))
+         NIR_PASS(_, nir, kk_nir_lower_mesh_grid);
 
       if (nir->info.stage == MESA_SHADER_VERTEX)
          vertex_robustness = info->robustness;

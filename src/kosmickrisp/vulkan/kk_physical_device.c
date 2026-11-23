@@ -880,13 +880,16 @@ kk_get_device_properties(
 
       /* VK_EXT_mesh_shader. Metal allows 256 vertices, 512 primitives and
        * 32 KiB of output per mesh threadgroup, and no more than 124 varying
-       * components, the position included. Threadgroup memory plus mesh output may not exceed
-       * 60 KiB, so mesh outputs are staged in device memory when a threadgroup
-       * copy does not fit, see msl_mesh_device_staging. Object functions
-       * reserve 16 bytes of threadgroup memory. Metal silently drops mesh
-       * grids, from draws and from object functions alike, of 2^20
-       * threadgroups or more. The object grid of a draw has no such limit.
-       * Some of these values are below the Vulkan minimums, which is why mesh
+       * components, the position included. Threadgroup memory plus mesh output
+       * may not exceed 60 KiB, so mesh outputs are staged in device memory when
+       * a threadgroup copy does not fit, see msl_mesh_device_staging. Object
+       * functions reserve 16 bytes of threadgroup memory. Metal silently drops
+       * mesh grids of 2^20 threadgroups or more, from draws and from object
+       * functions alike. The object grid of a draw has no such limit, so
+       * draws without task shader launch their grid in chunks, see
+       * KK_MESH_GRID_MAX_CHUNKS, but the grid a task workgroup emits stays a
+       * single Metal grid, which bounds the mesh workgroup count. Some of
+       * these values are below the Vulkan minimums, which is why mesh
        * shaders are experimental. Multiview draws once per view, see
        * kk_draw_mesh, but render pass clears go through vertex amplification,
        * which bounds the view count. */

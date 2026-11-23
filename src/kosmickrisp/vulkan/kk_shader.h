@@ -47,6 +47,47 @@ kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
    return out;
 }
 
+/* Metal silently drops a mesh grid when a dimension exceeds 65535 or
+ * bits(x) + bits(y) + bits(z) > 22, with bits(n) = floor(log2(n)) + 1, from a
+ * draw without object stage and from an object function alike. Grids of fewer
+ * than 2^20 threadgroups always run, and the object grid of a draw has no such
+ * limit. Mesh pipelines without task shader therefore get a synthetic object
+ * stage, see kk_device_lib.c, whose threadgroup k launches chunk k of the
+ * grid: whole Z slices when an XY slice fits in a chunk, else a range of rows
+ * of one slice. Chunks follow the linear workgroup order, which keeps the
+ * primitive order, and a grid of up to 2^22 workgroups needs no more than 8 of
+ * them. The mesh shader adds the chunk base to its workgroup ID and reads
+ * NumWorkGroups from the payload, see kk_nir_lower_mesh_grid.
+ */
+#define KK_MESH_GRID_MAX_CHUNKS   8u
+#define KK_MESH_GRID_CHUNK_GROUPS ((1u << 20) - 1u)
+
+/* Synthetic payload: uint base_y, uint base_z, packed_uint3 group counts */
+#define KK_MESH_GRID_PAYLOAD_BASE   0u
+#define KK_MESH_GRID_PAYLOAD_COUNTS 8u
+#define KK_MESH_GRID_PAYLOAD_SIZE   32u
+
+/* Chunks of a grid, must match the synthetic object stage. Grids beyond the
+ * limits get the chunks of the largest grid. */
+static inline uint32_t
+kk_mesh_grid_chunks(uint32_t x, uint32_t y, uint32_t z)
+{
+   if (x == 0u || y == 0u || z == 0u)
+      return 0u;
+
+   uint64_t slice = (uint64_t)x * y;
+   uint64_t chunks;
+   if (slice <= KK_MESH_GRID_CHUNK_GROUPS) {
+      uint32_t slices =
+         MIN2(KK_MESH_GRID_CHUNK_GROUPS / (uint32_t)slice, 65535u);
+      chunks = DIV_ROUND_UP(z, slices);
+   } else {
+      uint32_t rows = MAX2(KK_MESH_GRID_CHUNK_GROUPS / x, 1u);
+      chunks = (uint64_t)z * DIV_ROUND_UP(y, rows);
+   }
+   return MIN2(chunks, KK_MESH_GRID_MAX_CHUNKS);
+}
+
 struct kk_shader_info {
    mesa_shader_stage stage;
    bool uses_per_draw_data;
@@ -192,6 +233,7 @@ bool kk_nir_add_device_barrier_workaround(nir_shader *nir);
 
 bool kk_nir_lower_poly(struct nir_shader *nir);
 bool kk_nir_lower_mesh_queries(nir_shader *nir);
+bool kk_nir_lower_mesh_grid(nir_shader *nir);
 bool kk_nir_lower_null_images(nir_shader *nir);
 
 bool kk_nir_lower_textures(nir_shader *nir);

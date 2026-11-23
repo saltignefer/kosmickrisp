@@ -107,6 +107,10 @@ struct kk_device {
    /* Mesh outputs that do not fit in threadgroup memory, see
     * MSL_MESH_STAGING_SIZE */
    struct kk_bo *mesh_staging;
+
+   /* Object stage of mesh pipelines without task shader, see
+    * KK_MESH_GRID_MAX_CHUNKS */
+   mtl_library *mesh_grid_object;
    util_once_flag heap_init_once;
 
    bool gpu_capture_active;

@@ -2765,6 +2765,21 @@ kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    assert(data->mesh);
    kk_flush_gfx_state(cmd);
 
+   /* Without task shader, the synthetic object stage reads the group counts
+    * of every draw from memory and launches the grid in chunks, see
+    * KK_MESH_GRID_MAX_CHUNKS. Direct draws launch the chunks they need,
+    * indirect ones the most a grid within the limits can need. */
+   bool chunked = cmd->state.shaders[MESA_SHADER_TASK] == NULL;
+   uint32_t chunks = KK_MESH_GRID_MAX_CHUNKS;
+   if (chunked && !data->indirect) {
+      assert(data->draw_count == 1u);
+      chunks = kk_mesh_grid_chunks(data->mesh_draws[0].groupCountX,
+                                   data->mesh_draws[0].groupCountY,
+                                   data->mesh_draws[0].groupCountZ);
+      if (unlikely(!kk_convert_to_indirect_draw(cmd, data)))
+         return;
+   }
+
    /* Count buffers and conditional rendering zero out disabled draws */
    if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
       return;
@@ -2785,6 +2800,8 @@ kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       if (shader && shader->info.uses_per_draw_data)
          upload_mask |= BITFIELD_BIT(stage);
    }
+   if (chunked)
+      upload_mask |= BITFIELD_BIT(MESA_SHADER_TASK);
 
    struct kk_per_draw_data *per_draw = &cmd->state.gfx.per_draw_data;
    const struct vk_dynamic_graphics_state *dyn =
@@ -2805,6 +2822,12 @@ kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 
    mtl_render_encoder *enc = cs_get_render(cmd);
    for (uint32_t i = 0; i < data->draw_count; i++) {
+      uint64_t addr = 0u;
+      if (data->indirect)
+         addr = data->indirect_command.addr +
+                (uint64_t)i * data->indirect_command.stride;
+      per_draw->mesh_grid_addr = chunked ? addr : 0u;
+
       u_foreach_bit(view, view_mask ? view_mask : 1u) {
          if (upload_mask) {
             struct kk_draw_data draw_data = {};
@@ -2812,9 +2835,10 @@ kk_draw_mesh(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
             kk_upload_per_draw_data(cmd, upload_mask, i, &draw_data, false);
          }
 
-         if (data->indirect) {
-            uint64_t addr = data->indirect_command.addr +
-                            (uint64_t)i * data->indirect_command.stride;
+         if (chunked) {
+            struct mtl_size grid = {chunks, 1u, 1u};
+            mtl_draw_mesh_threadgroups(enc, grid, task_threads, mesh_threads);
+         } else if (data->indirect) {
             mtl_draw_mesh_threadgroups_indirect(enc, addr, task_threads,
                                                 mesh_threads);
          } else {

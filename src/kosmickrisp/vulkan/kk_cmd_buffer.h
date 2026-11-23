@@ -105,6 +105,10 @@ struct kk_per_draw_data {
    uint64_t task_invocations_query;
    uint64_t mesh_invocations_query;
    uint64_t mesh_primitives_query;
+
+   /* Group counts of a mesh draw without task shader, which the synthetic
+    * object stage reads. See KK_MESH_GRID_MAX_CHUNKS. */
+   uint64_t mesh_grid_addr;
 };
 
 struct kk_attachment {
