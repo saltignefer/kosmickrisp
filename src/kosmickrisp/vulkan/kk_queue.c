@@ -41,8 +41,9 @@ kk_queue_release_cmd_buffer_locked(struct kk_queue *queue,
    util_dynarray_append(&queue->free_cmd_buffers, &cmd->vk);
 }
 
-static void
-check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
+void
+kk_queue_check_device_lost(struct kk_device *dev,
+                           struct mtl_feedback_data *data)
 {
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
       kk_device_reset_atomic64_locks(dev);
@@ -55,7 +56,12 @@ check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
 static void
 commit_callback(struct mtl_feedback_data *data)
 {
-   check_device_lost((struct kk_device *)data->user_data, data);
+   struct kk_queue *queue = data->user_data;
+   kk_queue_check_device_lost(kk_queue_device(queue), data);
+
+   mtx_lock(&queue->mutex);
+   kk_queue_end_commit_locked(queue);
+   mtx_unlock(&queue->mutex);
 }
 
 void
@@ -76,19 +82,19 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
    struct kk_queue *queue = commit->queue;
    struct kk_device *dev = kk_queue_device(queue);
 
-   check_device_lost(dev, data);
+   kk_queue_check_device_lost(dev, data);
 
    /* Completion callbacks are called from multiple threads, so we need to
     * ensure the access to queue resources is safe. */
    mtx_lock(&queue->mutex);
 
    kk_queue_release_cmd_buffer_locked(queue, commit->cmd);
+   /* The device may go away once the commit no longer counts */
+   vk_free(&dev->vk.alloc, commit);
 
    kk_queue_end_commit_locked(queue);
 
    mtx_unlock(&queue->mutex);
-
-   vk_free(&dev->vk.alloc, commit);
 }
 
 static bool
@@ -227,7 +233,10 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          if (result != VK_SUCCESS)
             return result;
       } else if (kk_cmd_buffer_has_work(cmd_buffer)) {
-         kk_queue_commit(queue, cmd_buffer, commit_callback, dev);
+         mtx_lock(&queue->mutex);
+         queue->commits_in_flight++;
+         mtx_unlock(&queue->mutex);
+         kk_queue_commit(queue, cmd_buffer, commit_callback, queue);
       }
 
       cmd_buffer->submitted = true;

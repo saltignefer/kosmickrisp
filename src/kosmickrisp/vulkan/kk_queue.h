@@ -51,6 +51,10 @@ kk_queue_device(struct kk_queue *queue)
  * this with the queue mutex held from the handler. */
 void kk_queue_end_commit_locked(struct kk_queue *queue);
 
+/* Marks the device lost when the commit of a completion handler failed */
+void kk_queue_check_device_lost(struct kk_device *dev,
+                                struct mtl_feedback_data *data);
+
 VkResult kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
                        const VkDeviceQueueCreateInfo *pCreateInfo,
                        uint32_t index_in_family);

@@ -414,6 +414,7 @@ kk_sparse_barrier_done(struct mtl_feedback_data *data)
 {
    struct kk_sparse_barrier *barrier = data->user_data;
    struct kk_queue *queue = barrier->queue;
+   kk_queue_check_device_lost(barrier->dev, data);
    kk_sparse_barrier_destroy(barrier);
 
    mtx_lock(&queue->mutex);

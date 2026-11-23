@@ -409,6 +409,13 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       mtl_stop_gpu_capture();
    }
 
+   /* Work still running after a device loss and completion handlers, which
+    * may reset the 64-bit atomic locks, use device resources */
+   if (dev->has_queue) {
+      kk_queue_finish(dev, &dev->queue);
+      dev->has_queue = false;
+   }
+
    /* Meta first since it may destroy Vulkan objects */
    kk_device_finish_meta(dev);
    kk_device_finish_lib(dev);
@@ -424,11 +431,6 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (dev->atomic64_locks)
       kk_destroy_bo(dev, dev->atomic64_locks);
-
-   if (dev->has_queue) {
-      kk_queue_finish(dev, &dev->queue);
-      dev->has_queue = false;
-   }
 
    /* Release the residency set last once all BOs are released. */
    mtl_release(dev->residency_set.handle);
