@@ -67,8 +67,11 @@ kk_vbo_internal_format(enum pipe_format format)
    /* We have native 8-bit and 16-bit normalized formats */
    struct util_format_channel_description chan = desc->channel[idx];
 
-   /* Otherwise map to the corresponding integer format */
+   /* Otherwise map to the corresponding integer format. 64-bit channels are
+    * fetched as pairs of dwords, IO lowering splits 64-bit inputs to 32-bit.
+    */
    switch (chan.size) {
+   case 64:
    case 32:
       return PIPE_FORMAT_R32_UINT;
    case 16:
@@ -109,6 +112,46 @@ apply_swizzle_channel(nir_builder *b, nir_def *vec, unsigned swizzle,
    }
 }
 
+/* Lowered 64-bit inputs read 32-bit halves, low dword first, with component
+ * counting dwords. Pass the dwords through untouched and fill the channels
+ * the format lacks from its swizzle.
+ */
+static nir_def *
+load_64bit_dwords(nir_builder *b, nir_intrinsic_instr *intr,
+                  const struct util_format_description *desc, bool is_float,
+                  nir_def *base, nir_def *el_offset, nir_def *oob,
+                  unsigned first_dword)
+{
+   assert(intr->def.bit_size == 32);
+   unsigned format_dwords = desc->nr_channels * 2;
+   unsigned end_dword = MIN2(first_dword + intr->num_components, format_dwords);
+
+   nir_def *memory = NULL;
+   if (first_dword < end_dword) {
+      memory =
+         nir_load_constant_agx(b, end_dword - first_dword, 32, base,
+                               nir_iadd_imm(b, el_offset, first_dword),
+                               .format = PIPE_FORMAT_R32_UINT, .base = 0u);
+      if (oob)
+         memory = nir_bcsel(b, oob, nir_imm_zero(b, memory->num_components, 32),
+                            memory);
+   }
+
+   nir_def *dwords[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < intr->num_components; ++i) {
+      unsigned dword = first_dword + i;
+      if (dword < format_dwords) {
+         dwords[i] = nir_channel(b, memory, dword - first_dword);
+      } else {
+         bool one = desc->swizzle[dword / 2] == PIPE_SWIZZLE_1;
+         uint64_t value = !one ? 0 : is_float ? dui(1.0) : 1;
+         dwords[i] = nir_imm_int(b, dword % 2 ? value >> 32 : (uint32_t)value);
+      }
+   }
+
+   return nir_vec(b, dwords, intr->num_components);
+}
+
 static bool
 pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -122,6 +165,13 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_src *offset_src = nir_get_io_offset_src(intr);
    assert(nir_src_is_const(*offset_src) && "no attribute indirects");
    unsigned index = nir_intrinsic_base(intr) + nir_src_as_uint(*offset_src);
+   unsigned first_dword = nir_intrinsic_component(intr);
+
+   /* The root table holds the base and clamp in the attribute's first slot */
+   if (attribs[index].upper_slot) {
+      index--;
+      first_dword += 4;
+   }
 
    struct kk_attribute attrib = attribs[index];
 
@@ -191,19 +241,29 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_def *stride_offset_el =
       nir_imul(b, el, nir_udiv_imm(b, stride, interchange_align));
 
-   /* Load the raw vector */
-   nir_def *memory = nir_load_constant_agx(
-      b, interchange_comps, interchange_register_size, base, stride_offset_el,
-      .format = interchange_format, .base = 0u);
-
+   nir_def *oob = NULL;
    if (ctx->requires_robustness2) {
       uint64_t attrib_clamp_offset =
          offsetof(struct kk_root_descriptor_table, draw.attrib_clamps[index]);
       nir_def *bounds = nir_load_global_constant(
          b, 1, 32, nir_iadd_imm(b, argbuf, attrib_clamp_offset));
-      nir_def *oob = nir_ult(b, bounds, el);
+      oob = nir_ult(b, bounds, el);
+   }
 
-      /* Produce zero for out-of-bounds access */
+   if (desc->channel[chan].size == 64) {
+      nir_def_rewrite_uses(
+         &intr->def, load_64bit_dwords(b, intr, desc, is_float, base,
+                                       stride_offset_el, oob, first_dword));
+      return true;
+   }
+
+   /* Load the raw vector */
+   nir_def *memory = nir_load_constant_agx(
+      b, interchange_comps, interchange_register_size, base, stride_offset_el,
+      .format = interchange_format, .base = 0u);
+
+   /* Produce zero for out-of-bounds access */
+   if (oob) {
       nir_def *zero = nir_imm_zero(b, memory->num_components, memory->bit_size);
       memory = nir_bcsel(b, oob, zero, memory);
    }

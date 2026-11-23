@@ -33,6 +33,11 @@ struct kk_attribute {
 
    unsigned buf   : 7;
    bool instanced : 1;
+
+   /* Second slot of a dvec3/dvec4 input, reads the upper 16 bytes of the
+    * attribute in the slot before.
+    */
+   bool upper_slot : 1;
 };
 
 bool kk_nir_lower_vbo(nir_shader *shader, struct kk_attribute *attribs,

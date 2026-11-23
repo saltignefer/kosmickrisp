@@ -537,6 +537,14 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
       attributes[slot].buf = attr->binding;
       attributes[slot].instanced =
          binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
+
+      /* dvec3 and dvec4 inputs also read the next location */
+      if (util_format_get_blocksize(attributes[slot].format) > 16 &&
+          (attribs_read & BITFIELD64_BIT(i + 1)) &&
+          !(state->vi->attributes_valid & BITFIELD_BIT(i + 1))) {
+         attributes[slot + 1] = attributes[slot];
+         attributes[slot + 1].upper_slot = true;
+      }
    }
    bool robustness2 =
       rs->vertex_inputs ==
@@ -1142,7 +1150,9 @@ gather_vs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    struct nir_io_semantics io = nir_intrinsic_io_semantics(intr);
    BITSET_WORD *attribs_read = data;
-   BITSET_SET(attribs_read, (io.location - VERT_ATTRIB_GENERIC0));
+   unsigned first = io.location - VERT_ATTRIB_GENERIC0;
+   /* Match the slots nir_gather_info reports, dvec3/dvec4 take two */
+   BITSET_SET_COUNT(attribs_read, first, io.num_slots);
    return false;
 }
 
