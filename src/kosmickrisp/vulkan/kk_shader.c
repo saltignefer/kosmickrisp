@@ -2730,6 +2730,12 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
          info->next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
                                   VK_SHADER_STAGE_GEOMETRY_BIT);
 
+      /* Metal forbids [[thread_index_in_simdgroup]] and simd_* intrinsics in
+       * vertex functions; lower subgroup ops in native (non-emulated) VS to a
+       * single-lane fallback before workarounds rewrite ballot/vote ops. */
+      if (nir->info.stage == MESA_SHADER_VERTEX && !emulated_stage)
+         msl_nir_lower_vs_subgroups(nir);
+
       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
       bool io_lowered = nir->info.io_lowered;
       kk_lower_nir(dev, nir, emulated_stage, info->robustness,

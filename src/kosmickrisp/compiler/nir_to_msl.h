@@ -57,6 +57,7 @@ void msl_preprocess_nir(struct nir_shader *nir);
  * instruction workarounds based on the disabled workarounds bitmask. */
 void msl_preprocess_nir_workarounds(struct nir_shader *nir,
                                     uint64_t disabled_workarounds);
+void msl_nir_lower_vs_subgroups(nir_shader *nir);
 
 enum msl_tex_access_flag {
    MSL_ACCESS_SAMPLE = 0,
