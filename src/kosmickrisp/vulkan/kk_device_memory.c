@@ -21,8 +21,6 @@
 
 #include <inttypes.h>
 #include <sys/mman.h>
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
 
 /* Supports mtlheap only */
 const VkExternalMemoryProperties kk_mtlheap_mem_props = {
@@ -137,59 +135,6 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
           * only be usable for buffers */
          mem->bo->map = mtl_new_buffer_with_bytes_no_copy(
             dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
-         if (!mem->bo->map &&
-             (((uintptr_t)host_info->pHostPointer & 0x3fffu) == 0) &&
-             ((mem->vk.size & 0x3fffu) == 0) && mem->vk.size > 0) {
-            /* Under Rosetta 2 + Wine (MEM_WRITE_WATCH), 4 KiB mprotect faults
-             * split a 16 KiB-aligned anonymous mapping into uncoalesceable
-             * 4 KiB vm_map_entries, which Metal's newBufferWithBytesNoCopy
-             * rejects even when all subregions are RW. Verify the range is
-             * fully mapped anonymous readable/writable-max memory, then
-             * defragment it in place at the exact same VA via mach_vm_remap so
-             * Metal can create a true zero-copy coherent buffer. */
-            uintptr_t start = (uintptr_t)host_info->pHostPointer;
-            size_t len = (size_t)mem->vk.size;
-            uintptr_t end = start + len;
-            uintptr_t cur = start;
-            bool ok = true;
-            while (cur < end) {
-               mach_vm_address_t r_addr = (mach_vm_address_t)cur;
-               mach_vm_size_t r_size = 0;
-               vm_region_basic_info_data_64_t r_info = {0};
-               mach_msg_type_number_t r_cnt = VM_REGION_BASIC_INFO_COUNT_64;
-               mach_port_t r_obj = MACH_PORT_NULL;
-               kern_return_t kr = mach_vm_region(
-                  mach_task_self(), &r_addr, &r_size, VM_REGION_BASIC_INFO_64,
-                  (vm_region_info_t)&r_info, &r_cnt, &r_obj);
-               if (kr != KERN_SUCCESS || r_addr > cur || r_size == 0 ||
-                   !(r_info.protection & VM_PROT_READ) ||
-                   !(r_info.max_protection & VM_PROT_WRITE)) {
-                  ok = false;
-                  break;
-               }
-               uintptr_t seg_end = (uintptr_t)(r_addr + r_size);
-               cur = seg_end > end ? end : seg_end;
-            }
-            if (ok) {
-               void *tmp = mmap(NULL, len, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANON, -1, 0);
-               if (tmp != MAP_FAILED) {
-                  memcpy(tmp, host_info->pHostPointer, len);
-                  mach_vm_address_t dst = (mach_vm_address_t)start;
-                  vm_prot_t cur_p = 0, max_p = 0;
-                  kern_return_t kr = mach_vm_remap(
-                     mach_task_self(), &dst, (mach_vm_size_t)len, 0,
-                     VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
-                     (mach_vm_address_t)(uintptr_t)tmp, FALSE, &cur_p, &max_p,
-                     VM_INHERIT_DEFAULT);
-                  munmap(tmp, len);
-                  if (kr == KERN_SUCCESS) {
-                     mem->bo->map = mtl_new_buffer_with_bytes_no_copy(
-                        dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
-                  }
-               }
-            }
-         }
          if (!mem->bo->map) {
             FREE(mem->bo);
             mem->bo = NULL;
