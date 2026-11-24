@@ -1362,6 +1362,35 @@ msl_nir_flush_fp32_denorms(nir_shader *nir)
                               nir_metadata_control_flow, NULL);
 }
 
+/* nir_lower_doubles' fix_inv_result flushes NaN to 0.0 when nir_fp_preserve_nan
+ * is unset (so 1.0 / NaN and rsq(x < 0) yield 0.0 instead of NaN). Mark 64-bit
+ * frcp/fdiv/frsq with nir_fp_preserve_nan and guard frsq(x < 0) before lowering. */
+static bool
+guard_fp64_inv_nan(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->def.bit_size != 64)
+      return false;
+
+   switch (alu->op) {
+   case nir_op_frcp:
+   case nir_op_fdiv:
+      alu->fp_math_ctrl |= nir_fp_preserve_nan;
+      return true;
+   case nir_op_frsq: {
+      alu->fp_math_ctrl |= nir_fp_preserve_nan;
+      b->cursor = nir_after_instr(&alu->instr);
+      nir_def *src = nir_ssa_for_alu_src(b, alu, 0);
+      nir_def *non_neg = nir_fge_imm(b, src, 0.0);
+      nir_def *guarded =
+         nir_bcsel(b, non_neg, &alu->def, nir_imm_double(b, NAN));
+      nir_def_rewrite_uses_after(&alu->def, guarded);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
 /* Metal has no double type. nir_to_msl prints fp64 ALU as calls into the
  * float64 library, see msl_float64_gen.py. Lower what the library has no
  * function for to ops it has. Runs after the optimization loop, which may
@@ -1385,6 +1414,8 @@ msl_nir_lower_fp64(nir_shader *nir)
             NULL);
    NIR_PASS(progress, nir, nir_lower_flrp, 64, false);
    NIR_PASS(progress, nir, nir_shader_alu_pass, widen_fp64_conversion,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(progress, nir, nir_shader_alu_pass, guard_fp64_inv_nan,
             nir_metadata_control_flow, NULL);
    /* The library has fsqrt, but not frcp, frsq, fceil, fmod, fsub and fdiv */
    NIR_PASS(progress, nir, nir_lower_doubles, NULL,

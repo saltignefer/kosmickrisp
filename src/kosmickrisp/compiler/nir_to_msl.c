@@ -548,7 +548,11 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
       alu_funclike_precise(ctx, instr, "floor");
       break;
    case nir_op_ffma:
-      alu_funclike_precise(ctx, instr, "fma");
+      /* Metal's fast::fma (default under MTL_MATH_MODE_FAST) may unfuse into
+       * mul+add; nir_op_ffma explicitly requests a fused multiply-add. */
+      if (instr->def.bit_size == 32)
+         P(ctx, "precise::");
+      alu_funclike(ctx, instr, "fma");
       break;
    case nir_op_ffract:
       /* Metal's fract returns values [0, 1] disregarding INFs and NANs */
