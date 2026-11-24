@@ -193,36 +193,8 @@ lower_vs_subgroup_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    case nir_intrinsic_exclusive_scan: {
       nir_op op = nir_intrinsic_reduction_op(intrin);
       unsigned bs = intrin->def.bit_size;
-      nir_def *id;
-      switch (op) {
-      case nir_op_imul:
-         id = nir_imm_intN_t(b, 1, bs);
-         break;
-      case nir_op_fmul:
-         id = nir_imm_floatN_t(b, 1.0, bs);
-         break;
-      case nir_op_iand:
-         id = nir_imm_intN_t(b, ~0ull, bs);
-         break;
-      case nir_op_umin:
-         id = nir_imm_intN_t(b, ~0ull, bs);
-         break;
-      case nir_op_imin:
-         id = nir_imm_intN_t(b, (1ull << (bs - 1)) - 1, bs);
-         break;
-      case nir_op_imax:
-         id = nir_imm_intN_t(b, 1ull << (bs - 1), bs);
-         break;
-      case nir_op_fmin:
-         id = nir_imm_floatN_t(b, INFINITY, bs);
-         break;
-      case nir_op_fmax:
-         id = nir_imm_floatN_t(b, -INFINITY, bs);
-         break;
-      default:
-         id = nir_imm_intN_t(b, 0, bs);
-         break;
-      }
+      nir_const_value ident = nir_alu_binop_identity(op, bs);
+      nir_def *id = nir_build_imm(b, 1, bs, &ident);
       replacement = intrin->def.num_components > 1
                        ? nir_replicate(b, id, intrin->def.num_components)
                        : id;
